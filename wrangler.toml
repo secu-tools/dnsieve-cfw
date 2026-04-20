@@ -1,0 +1,62 @@
+name = "dnsieve-cfw"
+main = "src/index.js"
+compatibility_date = "2026-04-08"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# Runtime variables (Cloudflare Workers environment bindings)
+# ---------------------------------------------------------------------------
+# These defaults mirror the values in src/config.js.
+# Override any value in the Cloudflare dashboard: Workers > Settings > Variables
+# without redeploying code. All values must be strings; arrays use JSON encoding.
+[vars]
+GENERAL_PROFILE_ID               = "000000"
+MIN_WAIT_MS                      = "200"
+UPSTREAM_TIMEOUT_MS              = "1500"
+MIN_CACHE_TTL_FLOOR              = "60"
+WORKER_CACHE_TTL_SECONDS         = "1800"
+WORKER_BLOCKED_CACHE_TTL_SECONDS = "86400"
+CLIENT_CACHE_TTL_SECONDS         = "1800"
+CLIENT_BLOCKED_CACHE_TTL_SECONDS = "86400"
+UPSTREAM_SERVERS                 = '["https://dns.quad9.net/dns-query","https://security.cloudflare-dns.com/dns-query"]'
+MAX_DNS_MESSAGE_SIZE             = "65535"
+DEBUG                            = "false"
+
+# ---------------------------------------------------------------------------
+# Privacy - EDNS option handling for outgoing queries and upstream responses
+# Modes are documented in src/config.js and the Privacy section of README.md.
+# ---------------------------------------------------------------------------
+# [privacy.ecs]
+PRIVACY_ECS_MODE                 = "strip"   # "strip", "forward", or "substitute"
+PRIVACY_ECS_SUBNET               = ""        # Required for substitute mode, e.g. "203.0.113.0/24"
+# [privacy.cookies]
+PRIVACY_COOKIES_MODE             = "reoriginate"  # "strip" or "reoriginate"
+# [privacy.nsid]
+PRIVACY_NSID_MODE                = "strip"   # "strip", "forward", or "substitute"
+PRIVACY_NSID_VALUE               = ""        # Required for substitute mode, e.g. "dnsieve-cfw-01"
+
+# ---------------------------------------------------------------------------
+# Blocking - controls how the proxy responds to blocked domains
+# Modes: "null" (A=0.0.0.0/AAAA=::), "nxdomain", "nodata", "refused"
+# Wire-format blocked responses always include EDE (RFC 8914) with the
+# blocking upstream URL: "Blocked (https://upstream/dns-query)"
+# ---------------------------------------------------------------------------
+BLOCKING_MODE                    = "null"    # Default: NOERROR with null IPs
+
+# ---------------------------------------------------------------------------
+# Cache renewal - stale-while-revalidate background refresh
+# When a cached entry has less than CACHE_RENEW_PERCENT% of its original
+# worker-side TTL remaining, the worker returns the cached response to
+# the client immediately and simultaneously re-queries all upstreams via
+# ctx.waitUntil() to refresh the cache.  Set to "0" to disable.
+# ---------------------------------------------------------------------------
+CACHE_RENEW_PERCENT              = "10"     # Refresh at 10% TTL remaining (0 = off)
+
+# ---------------------------------------------------------------------------
+# Observability - explicitly disabled to prevent Cloudflare from persisting
+# request logs in the dashboard (Workers Logs). This is opt-in by design;
+# disabling it here makes the privacy posture explicit and survives dashboard
+# resets.
+# ---------------------------------------------------------------------------
+[observability]
+enabled = false

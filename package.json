@@ -1,0 +1,28 @@
+{
+  "name": "dnsieve-cfw",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker DNS-over-HTTPS multi-upstream proxy with blocking detection and per-profile routing",
+  "author": "Jack L. (Cpt-JackL) <https://jack-l.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/secu-tools/dnsieve-cfw.git"
+  },
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.14.2",
+    "@cloudflare/workers-types": "^4.20250408.0",
+    "@vitest/coverage-v8": "^4.1.3",
+    "vitest": "^4.1.3",
+    "wrangler": "^4.11.0"
+  }
+}

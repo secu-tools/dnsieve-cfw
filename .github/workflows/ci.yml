@@ -1,0 +1,32 @@
+name: CI
+
+# Deployment is handled by Cloudflare Builds (native git integration).
+# Configure in the Cloudflare dashboard: Worker > Settings > Builds.
+#   Build command:  npm test
+#   Deploy command: npx wrangler deploy   (Cloudflare default)
+# This workflow only runs tests so pull requests are validated before merge.
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test

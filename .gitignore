@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Test coverage
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db
