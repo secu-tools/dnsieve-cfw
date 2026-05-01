@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/config_validation.test.js
 // Tests for configuration validation edge cases: NaN values, invalid types,
 // extreme ranges, and malformed environment bindings.

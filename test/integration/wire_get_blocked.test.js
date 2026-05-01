@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/integration/wire_get_blocked.test.js
 // Integration tests: wire GET requests for blocked domains MUST use the
 // configured BLOCKING_MODE to generate a local response instead of falling

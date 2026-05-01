@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc7873_cookies.test.js
 // Tests for DNS Cookie handling (RFC 7873): reoriginate mode, strip mode,
 // cookie store management, and cookie option processing.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/config.test.js
 // Unit tests for configuration constants (src/config.js)
 

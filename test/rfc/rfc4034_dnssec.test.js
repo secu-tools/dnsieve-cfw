@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc4034_dnssec.test.js
 // Tests for RFC 4034 / RFC 4035 DNSSEC compliance
 //

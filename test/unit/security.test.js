@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/security.test.js
 // Security-focused tests covering CORS on error responses, internal error
 // suppression, content-type case sensitivity, and input validation.

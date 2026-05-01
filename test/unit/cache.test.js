@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/cache.test.js
 // Unit tests for cache key construction and cache TTL helpers (src/cache.js)
 

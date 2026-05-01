@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/index.test.js
 // Unit tests for worker entrypoint error handling (src/index.js)
 

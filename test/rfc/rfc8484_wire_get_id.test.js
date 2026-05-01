@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc8484_wire_get_id.test.js
 // RFC 8484 SS.4.1 compliance: DNS transaction ID MUST be 0 in upstream queries.
 // This file specifically tests the wire GET path (F-01 fix).

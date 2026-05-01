@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc8914_ede.test.js
 // RFC 8914 Extended DNS Errors compliance tests
 //

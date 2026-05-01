@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/cache_consistency.test.js
 // Tests for cache key consistency: trailing dot normalization, wire/JSON key
 // unification, malformed query fallback, and canonicalization.

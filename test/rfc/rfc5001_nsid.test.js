@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc5001_nsid.test.js
 // Tests for RFC 5001 NSID (Name Server Identifier) handling:
 // strip, forward, and substitute modes.

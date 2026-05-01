@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+#
 name: CI
+run-name: ${{ github.workflow }} - ${{ github.event.head_commit.message }}
 
 # Deployment is handled by Cloudflare Builds (native git integration).
 # Configure in the Cloudflare dashboard: Worker > Settings > Builds.

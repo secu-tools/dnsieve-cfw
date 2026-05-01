@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/rfc/rfc6672_dname.test.js
 // RFC 6672 DNAME (Delegation Name) record type compliance tests
 

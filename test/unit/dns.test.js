@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/dns.test.js
 // Unit tests for DNS wire format parsing and JSON conversion (src/dns.js)
 //

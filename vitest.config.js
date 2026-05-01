@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// dnsieve-cfw - Vitest / Cloudflare Workers test configuration
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 

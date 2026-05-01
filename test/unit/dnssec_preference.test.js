@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/dnssec_preference.test.js
 // Unit tests for DNSSEC data detection and DNSSEC preference functions
 

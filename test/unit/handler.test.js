@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/handler.test.js
 // Unit tests for handler helpers: extractProfileId, buildResponse,
 // computeClientTtl, and hardcoded blocking/DNSSEC behaviour.

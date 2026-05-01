@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/integration/worker.test.js
 // Integration tests for the Cloudflare Worker request handler.
 // These tests exercise the full handleRequest() pipeline with mocked upstreams

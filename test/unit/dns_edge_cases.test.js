@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/unit/dns_edge_cases.test.js
 // Edge case tests for DNS wire parsing: malformed packets, boundary conditions,
 // compression pointer safety, buffer bounds, and truncated payloads.

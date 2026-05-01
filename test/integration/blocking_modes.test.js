@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2020-2026 Jack L. (Cpt-JackL) (https://jack-l.com)
+//
 // test/integration/blocking_modes.test.js
 // Integration tests for all blocking modes: null, nxdomain, nodata, refused.
 // Tests both JSON and wire-format blocked responses, EDE inclusion, and
