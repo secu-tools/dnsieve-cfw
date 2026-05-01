@@ -1,5 +1,4 @@
 // test/rfc/rfc4343_rfc5891.test.js
-// Tests ported / adapted from the companion Go DNS project (D:\Code\DNS)
 //
 // RFC 4343 - DNS Case Insensitivity
 //   DNS names are case-insensitive (RFC 4343 SS.2). Cache keys and comparisons

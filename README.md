@@ -181,9 +181,9 @@ the entry expires and forces a synchronous upstream round-trip.
 Set `CACHE_RENEW_PERCENT = 0` to revert to on-demand-only caching (the previous default
 behaviour).
 
-The `X-Cache-Inserted-At` header stored internally on each edge-cache entry records the Unix
-timestamp (seconds) when the entry was written. This is used by the worker to calculate remaining
-TTL at serve time. The header is not forwarded to clients.
+The `X-Cache-Inserted-At` header is written when the edge-cache entry is stored
+and is used internally to calculate remaining TTL at serve time. It is also
+exposed on responses served from the edge cache for diagnostic visibility.
 
 ### Debug logging
 

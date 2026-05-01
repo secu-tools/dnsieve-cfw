@@ -15,7 +15,7 @@ import {
   GENERAL_PROFILE_ID,
   getConfig,
 } from "./config.js";
-import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, injectEdeToResponse, buildServfailResponse } from "./dns.js";
+import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, buildServfailResponse } from "./dns.js";
 import { buildUpstreamUrl, queryUpstream } from "./upstream.js";
 import { buildCacheKey, putCache, computeClientTtl, shouldRenewCache } from "./cache.js";
 import { extractMinTtlWire, extractMinTtl } from "./dns.js";
@@ -64,26 +64,6 @@ export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
     return new Response(result.raw, { status: 200, headers: dohWireHeaders(extra) });
   }
   return new Response(JSON.stringify(result.json), { status: 200, headers: dohJsonHeaders(extra) });
-}
-
-/**
- * Restore the client's original DNS transaction ID into a wire response.
- * The cached copy retains ID=0 (RFC 8484 SS.4.1); only the copy sent to the
- * client is patched with the original ID.
- *
- * @param {Response} response
- * @param {number} dnsId - Original 16-bit DNS transaction ID
- * @returns {Promise<Response>}
- */
-export async function restoreWireId(response, dnsId) {
-  const ct = response.headers.get("content-type") || "";
-  if (!ct.includes("dns-message")) return response;
-  const buf = new Uint8Array(await response.arrayBuffer());
-  if (buf.length >= 2) {
-    buf[0] = (dnsId >> 8) & 0xff;
-    buf[1] = dnsId & 0xff;
-  }
-  return new Response(buf, { status: response.status, headers: response.headers });
 }
 
 /**

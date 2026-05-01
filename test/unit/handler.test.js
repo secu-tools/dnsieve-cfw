@@ -1,9 +1,9 @@
 // test/unit/handler.test.js
-// Unit tests for handler helpers: extractProfileId, buildResponse, restoreWireId,
+// Unit tests for handler helpers: extractProfileId, buildResponse,
 // computeClientTtl, and hardcoded blocking/DNSSEC behaviour.
 
 import { describe, it, expect } from "vitest";
-import { extractProfileId, buildResponse, restoreWireId } from "../../src/handler.js";
+import { extractProfileId, buildResponse } from "../../src/handler.js";
 import { computeClientTtl } from "../../src/cache.js";
 import {
   buildDnsResponse,
@@ -174,55 +174,6 @@ describe("buildResponse", () => {
 });
 
 // ---------------------------------------------------------------------------
-// restoreWireId
-// ---------------------------------------------------------------------------
-
-describe("restoreWireId", () => {
-  it("patches bytes 0-1 with the client DNS ID for wire responses", async () => {
-    const rawBuf = buildDnsResponse("example.com.", "1.2.3.4", 300);
-    const resp = new Response(rawBuf, {
-      headers: { "Content-Type": "application/dns-message" },
-    });
-    const patched = await restoreWireId(resp, 0xabcd);
-    const outBuf = new Uint8Array(await patched.arrayBuffer());
-    expect(outBuf[0]).toBe(0xab);
-    expect(outBuf[1]).toBe(0xcd);
-  });
-
-  it("returns JSON response unchanged", async () => {
-    const body = JSON.stringify({ Status: 0 });
-    const resp = new Response(body, {
-      headers: { "Content-Type": "application/dns-json" },
-    });
-    const result = await restoreWireId(resp, 0x1234);
-    const text = await result.text();
-    expect(text).toBe(body);
-  });
-
-  it("handles DNS ID = 0 (no-op patch)", async () => {
-    const rawBuf = buildDnsResponse("example.com.", "1.2.3.4", 300);
-    const resp = new Response(rawBuf, {
-      headers: { "Content-Type": "application/dns-message" },
-    });
-    const patched = await restoreWireId(resp, 0);
-    const outBuf = new Uint8Array(await patched.arrayBuffer());
-    expect(outBuf[0]).toBe(0);
-    expect(outBuf[1]).toBe(0);
-  });
-
-  it("returns short wire payload unchanged without throwing", async () => {
-    const short = new Uint8Array([0xaa]);
-    const resp = new Response(short, {
-      headers: { "Content-Type": "application/dns-message" },
-    });
-    const patched = await restoreWireId(resp, 0x1234);
-    const outBuf = new Uint8Array(await patched.arrayBuffer());
-    expect(outBuf.length).toBe(1);
-    expect(outBuf[0]).toBe(0xaa);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // computeClientTtl
 // ---------------------------------------------------------------------------
 
@@ -357,42 +308,6 @@ describe("buildResponse - security headers", () => {
     const result1 = { ...fakeResult, index: 1 };
     const resp = buildResponse(result1, "aabbcc", false, true);
     expect(resp.headers.get("x-upstream-index")).toBe("1");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// restoreWireId - additional coverage
-// ---------------------------------------------------------------------------
-
-describe("restoreWireId - additional coverage", () => {
-  it("preserves full payload length after ID patch", async () => {
-    const rawBuf = buildDnsResponse("example.com.", "1.2.3.4", 300);
-    const originalLength = rawBuf.length;
-    const resp = new Response(rawBuf, { headers: { "Content-Type": "application/dns-message" } });
-    const patched = await restoreWireId(resp, 0x1122);
-    const outBuf = new Uint8Array(await patched.arrayBuffer());
-    expect(outBuf.length).toBe(originalLength);
-  });
-
-  it("patched response body bytes 2+ remain unchanged", async () => {
-    const rawBuf = buildDnsResponse("example.com.", "1.2.3.4", 300);
-    const original = new Uint8Array(rawBuf); // copy before patching
-    const resp = new Response(rawBuf, { headers: { "Content-Type": "application/dns-message" } });
-    const patched = await restoreWireId(resp, 0xffff);
-    const outBuf = new Uint8Array(await patched.arrayBuffer());
-    for (let i = 2; i < outBuf.length; i++) {
-      expect(outBuf[i]).toBe(original[i]);
-    }
-  });
-
-  it("returns response with matching status code", async () => {
-    const rawBuf = buildDnsResponse("example.com.", "1.2.3.4", 300);
-    const resp = new Response(rawBuf, {
-      status: 200,
-      headers: { "Content-Type": "application/dns-message" },
-    });
-    const patched = await restoreWireId(resp, 0x0001);
-    expect(patched.status).toBe(200);
   });
 });
 
