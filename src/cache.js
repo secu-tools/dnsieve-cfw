@@ -31,39 +31,77 @@ import {
 } from "./config.js";
 
 // Build the canonical cache key URL from extracted query name and numeric type.
-function metaToCacheKey(profileId, rawName, qtype) {
+// The type segment is percent-encoded: for JSON GET requests it can contain an
+// arbitrary client-supplied string, and a raw "/" or "../" inside it would let
+// a crafted ?type= value collide with (and poison) another record's cache key.
+// flagsVariant namespaces non-standard queries (see queryFlagsVariant).
+function metaToCacheKey(profileId, rawName, qtype, flagsVariant = "") {
   const name = toASCII(rawName.replace(/\.$/, "") || ".");
   const type = DNS_NUMBER_TO_TYPE[qtype] ? normalizeType(DNS_NUMBER_TO_TYPE[qtype]) : String(qtype);
   return new Request(
-    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${type}`,
+    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${encodeURIComponent(type)}${flagsVariant}`,
     { method: "GET" }
   );
 }
 
+// Cache-key suffix isolating non-standard queries in their own namespace.
+//
+// The cache key is deliberately shared across request formats and DO values,
+// but header flags that change what the upstream returns MUST partition the
+// cache: a CD=1 query bypasses upstream DNSSEC validation (RFC 4035 S3.2.2),
+// an RD=0 query is answered without recursion, and a non-QUERY opcode yields
+// NOTIMP. Without this, an attacker could poison the shared entry that
+// standard queries for the same name/type are served from.
+//
+// Standard queries (opcode QUERY, RD=1, CD=0) return "" so the established
+// key format - and cross-format cache sharing - is unchanged for them.
+// The suffix cannot collide with the type segment: normalizeType upper-cases
+// client-supplied types, while this suffix contains lower-case letters.
+function queryFlagsVariant(opcode, rd, cd) {
+  if (opcode === 0 && rd && !cd) return "";
+  return `!o${opcode}r${rd ? 1 : 0}c${cd ? 1 : 0}`;
+}
+
+// Extracts the flags variant from a wire-format query header.
+function wireFlagsVariant(buf) {
+  if (!buf || buf.length < 4) return "";
+  const opcode = (buf[2] >> 3) & 0x0f;
+  const rd = !!(buf[2] & 0x01);
+  const cd = !!(buf[3] & 0x10);
+  return queryFlagsVariant(opcode, rd, cd);
+}
+
 // Builds the cache lookup key for a request.
+// wireGetBytes: optional pre-decoded ?dns= payload (the handler already
+// base64url-decodes wire GET requests; passing it here avoids a second decode).
 // Returns a Request for synchronous paths (JSON GET and valid wire GET/POST)
 // or a Promise<Request> for wire POST when name extraction fails (SHA-256 fallback).
-export function buildCacheKey(profileId, url, bodyBytes) {
+export function buildCacheKey(profileId, url, bodyBytes, wireGetBytes = null) {
   // Wire POST: extract name+type from body (synchronous for well-formed queries)
   if (bodyBytes) {
     const meta = extractQueryNameType(bodyBytes);
-    if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype);
+    if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype, wireFlagsVariant(bodyBytes));
     // Fallback for malformed queries: SHA-256 hash of the body bytes
     return buildCacheKeyAsync(profileId, bodyBytes);
   }
 
-  // Wire GET: decode base64url and extract from the wire message
+  // Wire GET: use pre-decoded bytes when supplied, otherwise decode base64url
   if (url.searchParams.has("dns")) {
-    try {
-      const b64 = url.searchParams.get("dns") || "";
-      const clean = b64.replace(/-/g, "+").replace(/_/g, "/");
-      const padded = clean + "=".repeat((4 - clean.length % 4) % 4);
-      const binStr = atob(padded);
-      const buf = new Uint8Array(binStr.length);
-      for (let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+    let buf = wireGetBytes;
+    if (!buf) {
+      try {
+        const b64 = url.searchParams.get("dns") || "";
+        const clean = b64.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = clean + "=".repeat((4 - clean.length % 4) % 4);
+        const binStr = atob(padded);
+        buf = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+      } catch { buf = null; }
+    }
+    if (buf) {
       const meta = extractQueryNameType(buf);
-      if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype);
-    } catch {}
+      if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype, wireFlagsVariant(buf));
+    }
     // Fallback: use stripped base64url directly as the key segment
     return new Request(
       `https://doh-cache.internal/${profileId}/wire/${encodeURIComponent(stripBase64Padding(url.searchParams.get("dns") || ""))}`,
@@ -71,12 +109,16 @@ export function buildCacheKey(profileId, url, bodyBytes) {
     );
   }
 
-  // JSON GET: name and type are already in the URL parameters
+  // JSON GET: name and type are already in the URL parameters.
+  // The JSON API has no opcode/RD equivalent (always QUERY with recursion),
+  // but ?cd=1 is forwarded upstream and must partition the cache like the
+  // wire-format CD bit does.
   const rawName = url.searchParams.get("name") || ".";
   const name = toASCII(rawName.replace(/\.$/, "") || ".");
   const type = normalizeType(url.searchParams.get("type"));
+  const flagsVariant = queryFlagsVariant(0, true, url.searchParams.get("cd") === "1");
   return new Request(
-    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${type}`,
+    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${encodeURIComponent(type)}${flagsVariant}`,
     { method: "GET" }
   );
 }

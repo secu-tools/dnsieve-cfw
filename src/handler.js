@@ -18,7 +18,6 @@ import {
 import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, buildServfailResponse } from "./dns.js";
 import { buildUpstreamUrl, queryUpstream } from "./upstream.js";
 import { buildCacheKey, putCache, computeClientTtl, shouldRenewCache } from "./cache.js";
-import { extractMinTtlWire, extractMinTtl } from "./dns.js";
 import { VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
@@ -241,7 +240,7 @@ function buildBlockedJson(blockedResult, mode, edeText, clientCd = false) {
 // has already been returned to the client, so errors here are silent.
 async function backgroundRefreshCache(cache, cacheKeyReq, request, url, bodyBytes, wireQueryBytes, isJsonGet, profileId, upstreamUrls, cfg) {
   try {
-    const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg));
+    const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg, wireQueryBytes));
     const settlements = await Promise.allSettled(promises);
     const results = settlements.map((s, i) => s.status === "fulfilled" ? s.value : { index: i, ok: false });
 
@@ -387,10 +386,17 @@ export async function handleRequest(request, env, ctx) {
       return new Response("Bad Request. DNS message in ?dns= parameter is too short.", { status: 400, headers: { "Content-Type": "text/plain", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } });
     }
     if (decoded.length >= 2) clientDnsId = (decoded[0] << 8) | decoded[1];
+    // RFC 8484 SS.4.1: zero the DNS ID (same as the POST path). Responses built
+    // from these bytes may be written to the shared edge cache, and cached
+    // messages must never carry one client's transaction ID; applyClientEdns
+    // restores the original ID on the direct reply.
+    if (decoded.length >= 2 && (decoded[0] !== 0 || decoded[1] !== 0)) {
+      decoded[0] = 0; decoded[1] = 0;
+    }
     // Save decoded bytes so the all-fail path can build a SERVFAIL response
     // mirroring the question section (RFC 8484 s4.2.1). Not assigned to
-    // bodyBytes to avoid interfering with buildCacheKey, which uses the URL
-    // ?dns= param directly for wire GET cache keys.
+    // bodyBytes to avoid interfering with buildCacheKey, which derives wire GET
+    // cache keys from these decoded bytes (or the URL ?dns= param as fallback).
     wireGetQueryBytes = decoded;
     clientWantsDo = hasDoBit(decoded);
     const getMeta = extractQueryNameType(decoded);
@@ -421,7 +427,7 @@ export async function handleRequest(request, env, ctx) {
 
   // Cache lookup
   const cache = caches.default;
-  const cacheKey = await buildCacheKey(profileId, url, bodyBytes);
+  const cacheKey = await buildCacheKey(profileId, url, bodyBytes, wireGetQueryBytes);
   const cached = await cache.match(cacheKey);
   if (cached) {
     if (cfg.DEBUG) console.log(`[DoH] Cache HIT  profileId=${profileId}`);
@@ -437,7 +443,7 @@ export async function handleRequest(request, env, ctx) {
 
   // Fan out to all upstreams concurrently
   const upstreamUrls = cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId));
-  const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg));
+  const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg, wireGetQueryBytes));
 
   const results = new Array(cfg.UPSTREAM_COUNT);
   let settledCount = 0;

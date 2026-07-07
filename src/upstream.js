@@ -79,9 +79,11 @@ export function buildUpstreamUrl(template, profileId) {
  * @param {Uint8Array|null} bodyBytes - POST body (ID already zeroed) or null
  * @param {boolean} clientWantsJson - True if client Accept: application/dns-json
  * @param {object} [cfg] - Optional runtime config from getConfig(env); falls back to module defaults
+ * @param {Uint8Array|null} [wireGetBytes] - Pre-decoded ?dns= payload for wire GET
+ *   requests (avoids re-decoding the base64url parameter per upstream)
  * @returns {Promise<{index: number, ok: boolean, blocked?: boolean, wire?: boolean, raw?: Uint8Array, json?: object}>}
  */
-export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, clientWantsJson, cfg) {
+export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, clientWantsJson, cfg, wireGetBytes = null) {
   const timeout = cfg ? cfg.UPSTREAM_TIMEOUT_MS : UPSTREAM_TIMEOUT_MS;
   const debug   = cfg ? cfg.DEBUG               : DEBUG;
   const cookiesMode = cfg ? cfg.PRIVACY_COOKIES_MODE : PRIVACY_COOKIES_MODE;
@@ -112,12 +114,22 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       let dnsParam = stripBase64Padding(url.searchParams.get("dns") || "");
       if (cfg) {
         try {
-          const padded = dnsParam.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - dnsParam.length % 4) % 4);
-          const binStr = atob(padded);
-          const decoded = new Uint8Array(binStr.length);
-          for (let i = 0; i < binStr.length; i++) decoded[i] = binStr.charCodeAt(i);
-          // RFC 8484 SS.4.1: zero the DNS ID before upstream forwarding (same as POST path)
-          if (decoded.length >= 2) { decoded[0] = 0; decoded[1] = 0; }
+          let decoded = wireGetBytes;
+          if (decoded) {
+            // RFC 8484 SS.4.1: forward with a zeroed DNS ID. The handler already
+            // zeroes it; copy before writing in case a caller passed live bytes.
+            if (decoded.length >= 2 && (decoded[0] !== 0 || decoded[1] !== 0)) {
+              decoded = decoded.slice();
+              decoded[0] = 0; decoded[1] = 0;
+            }
+          } else {
+            const padded = dnsParam.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - dnsParam.length % 4) % 4);
+            const binStr = atob(padded);
+            decoded = new Uint8Array(binStr.length);
+            for (let i = 0; i < binStr.length; i++) decoded[i] = binStr.charCodeAt(i);
+            // RFC 8484 SS.4.1: zero the DNS ID before upstream forwarding (same as POST path)
+            if (decoded.length >= 2) { decoded[0] = 0; decoded[1] = 0; }
+          }
           const processed = processEdnsOutgoing(decoded, cfg, cookieBytes);
           let reenc = "";
           for (let i = 0; i < processed.length; i++) reenc += String.fromCharCode(processed[i]);
