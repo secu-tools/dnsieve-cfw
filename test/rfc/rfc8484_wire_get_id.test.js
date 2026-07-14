@@ -3,7 +3,7 @@
 //
 // test/rfc/rfc8484_wire_get_id.test.js
 // RFC 8484 SS.4.1 compliance: DNS transaction ID MUST be 0 in upstream queries.
-// This file specifically tests the wire GET path (F-01 fix).
+// This file specifically tests the wire GET path.
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { buildDnsQuery, buildDnsResponse, buildDnsQueryWithDo, processEdnsOutgoing } from "../../src/dns.js";

@@ -139,7 +139,7 @@ describe("Content-Type case insensitivity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Wire GET size validation (F-05)
+// Wire GET size validation
 // ---------------------------------------------------------------------------
 
 describe("Wire GET oversized payload rejection", () => {

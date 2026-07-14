@@ -389,10 +389,9 @@ export function buildEcsOption(subnetStr) {
  * it to an upstream resolver.
  *
  * Behaviour per option:
- *   DO bit is ALWAYS forced to 1 in outgoing queries regardless of what the
- *   client requested (RFC 4035 Section 3.2.1). This ensures the cache is always
- *   populated with DNSSEC-signed records. Responses are stripped of DNSSEC RRs
- *   for non-DO clients in handler.js via stripDnssecFromWire / stripDnssecFromJson.
+ *   DO bit is ALWAYS forced to 1 (RFC 4035 Section 3.2.1) so the cache is
+ *   always populated with DNSSEC-signed records; handler.js strips DNSSEC RRs
+ *   from responses to non-DO clients.
  *   ECS  (code 8)  cfg.PRIVACY_ECS_MODE:  "strip" removes it; "forward" passes it
  *                  through if present; "substitute" injects a fixed subnet.
  *   Cookie (code 10) cfg.PRIVACY_COOKIES_MODE: "strip" removes it; "reoriginate"
@@ -400,8 +399,6 @@ export function buildEcsOption(subnetStr) {
  *   NSID (code 3)  cfg.PRIVACY_NSID_MODE: "strip" removes it; "forward" passes it
  *                  through; "substitute" removes it (proxy handles NSID at response time).
  *   All other options are stripped (privacy-by-default for unknown options).
- *
- * Returns the original buffer unchanged when no modification is required.
  *
  * @param {Uint8Array} buf - Outgoing DNS wire query
  * @param {object} cfg - Runtime config object from getConfig()
@@ -414,12 +411,7 @@ export function processEdnsOutgoing(buf, cfg, cookieBytes) {
   const addCookie   = cfg.PRIVACY_COOKIES_MODE === "reoriginate" && cookieBytes != null;
   const addSubstEcs = cfg.PRIVACY_ECS_MODE     === "substitute"  && !!cfg.PRIVACY_ECS_SUBNET;
 
-  // RFC 4035 Section 3.2.1: always set the DO (DNSSEC OK) bit so that upstream
-  // resolvers return DNSSEC records. This ensures the cache is always populated
-  // with signatures and authenticated denial records regardless of what the
-  // originating client requested. Responses for non-DO clients are stripped of
-  // DNSSEC RRs before being returned (see stripDnssecFromWire / stripDnssecFromJson).
-  const doBit = true;
+  const doBit = true; // always forced on (see doc comment above)
   const newOptions = [];
 
   // ECS
@@ -441,11 +433,7 @@ export function processEdnsOutgoing(buf, cfg, cookieBytes) {
     const nsidOpt = opt.options.find(o => o.code === 3);
     if (nsidOpt) newOptions.push(nsidOpt);
   }
-  // "substitute": not forwarded to upstream; handled at response level
-  // "strip": nothing added
-
-  // doBit is always true; keepOpt is therefore always true.
-  // We always emit an OPT record with DO=1 in outgoing queries.
+  // An OPT record with DO=1 is always emitted in outgoing queries.
   if (opt) {
     return replaceOpt(buf, opt, buildOptRecord(doBit, newOptions));
   }
@@ -463,18 +451,11 @@ const DNSSEC_AUTH_TYPES = new Set([46, 47, 48, 50]); // RRSIG, NSEC, DNSKEY, NSE
 
 /**
  * Strip DNSSEC authentication records from a DNS wire response when the
- * client did not set the DO (DNSSEC OK) bit.
+ * client did not set the DO (DNSSEC OK) bit (RFC 4035 Section 3.1.4.1).
  *
- * Per RFC 4035 Section 3.1.4.1, a security-aware name server MUST NOT include
- * RRSIG, DNSKEY, NSEC, or NSEC3 RRs unless the RR type was explicitly
- * requested or the DO bit is set.
- *
- * Records of type RRSIG/NSEC/NSEC3/DNSKEY are removed from the Answer
- * section unless their type equals queryQtype (explicit request exception).
- * In the Authority section they are always removed.
- * ANCOUNT and NSCOUNT are updated to reflect removed records.
- * Other sections are passed through unchanged.
- *
+ * RRSIG/NSEC/NSEC3/DNSKEY records are removed from the Answer section unless
+ * their type equals queryQtype (explicit request exception); in the Authority
+ * section they are always removed. ANCOUNT/NSCOUNT are updated accordingly.
  * Returns the original buffer if no records need to be removed.
  *
  * @param {Uint8Array} buf - DNS wire response
@@ -542,13 +523,8 @@ export function stripDnssecFromWire(buf, queryQtype) {
 }
 
 /**
- * Strip DNSSEC authentication records from a Google/Cloudflare JSON DoH
- * response when the client did not set the DO bit.
- *
- * Applies the same RFC 4035 Section 3.1.4.1 rule as stripDnssecFromWire:
- *   - Answer section: remove RRSIG/NSEC/DNSKEY/NSEC3 unless type === queryQtype
- *   - Authority section: always remove RRSIG/NSEC/DNSKEY/NSEC3
- *
+ * Strip DNSSEC authentication records from a JSON DoH response when the
+ * client did not set the DO bit. Same rules as stripDnssecFromWire.
  * Returns the original object unchanged if no records need to be removed.
  *
  * @param {object} json - Parsed JSON DoH response object
@@ -635,17 +611,10 @@ export function processEdnsIncoming(buf, cfg, onServerCookie) {
 
 /**
  * Clear the DNSSEC OK (DO) bit in a DNS wire response OPT record when the
- * originating client did not set DO=1 in its query.
- *
- * RFC 6891 Section 6.1.4 / RFC 3225:
- *   "The DO bit of the query MUST be copied in the response."
- *
- * The cached copy always has DO=1 because the proxy always requests DNSSEC
- * upstream. Before returning to a non-DO client the DO bit must be cleared to
- * accurately reflect that the response was NOT signed per the client's request.
- *
- * Returns the original buffer unchanged when no OPT record is present or the
- * DO bit is already cleared.
+ * originating client did not set DO=1 in its query (RFC 6891 Section 6.1.4 /
+ * RFC 3225: the DO bit of the query must be mirrored in the response; cached
+ * copies always carry DO=1). Returns the original buffer unchanged when no
+ * OPT record is present or the DO bit is already cleared.
  *
  * @param {Uint8Array} buf - DNS wire response
  * @returns {Uint8Array}
@@ -659,12 +628,8 @@ export function clearDoBitInResponse(buf) {
 
 /**
  * Returns true if the DNS wire message has the DNSSEC OK (DO) bit set in its
- * EDNS OPT record. Returns false if there is no OPT record or the DO bit is
- * not set.
- *
- * RFC 4034 Section 4.1 / RFC 6891 Section 6.1.4:
- *   The DO bit signals to the resolver that DNSSEC-related resource records
- *   (RRSIG, NSEC, NSEC3, DNSKEY) should be included in the response.
+ * EDNS OPT record (RFC 6891 Section 6.1.4). Returns false if there is no OPT
+ * record or the DO bit is not set.
  *
  * @param {Uint8Array|null} buf
  * @returns {boolean}
@@ -1114,15 +1079,11 @@ export function buildDnsResponse(name, ip, ttl = 300, rcode = 0, nscount = 0) {
 }
 
 /**
- * Build a SERVFAIL (rcode=2) wire-format response for a given query.
- *
- * Per RFC 8484 s4.2.1 any valid DNS response, including SERVFAIL, MUST be
- * returned with HTTP 200. This function builds a local SERVFAIL reply so the
- * proxy never returns a bare HTTP 502 to a DoH client.
- *
- * The question section from queryBytes is mirrored into the response so the
- * client can correlate the reply with its original query. If queryBytes is
- * absent or malformed a header-only SERVFAIL (12 bytes, QDCOUNT=0) is returned.
+ * Build a SERVFAIL (rcode=2) wire-format response for a given query, used
+ * when all upstreams fail (RFC 8484 s4.2.1: returned with HTTP 200, never a
+ * bare 502). The question section from queryBytes is mirrored into the
+ * response; if queryBytes is absent or malformed a header-only SERVFAIL is
+ * returned.
  *
  * @param {Uint8Array|null} queryBytes - Original query wire bytes (ID already zeroed)
  * @returns {Uint8Array}
@@ -1296,8 +1257,7 @@ export function injectEdeToResponse(buf, infoCode, extraText = "") {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a DNS wire response for a blocked domain. Supports multiple blocking
- * modes as inspired by Pi-hole and Technitium blocking strategies.
+ * Build a DNS wire response for a blocked domain.
  *
  * Modes:
  *   "null"      - NOERROR with A=0.0.0.0 / AAAA=:: (Pi-hole NULL mode)

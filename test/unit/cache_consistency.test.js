@@ -10,7 +10,7 @@ import { buildCacheKey } from "../../src/cache.js";
 import { buildDnsQuery } from "../../src/dns.js";
 
 // ---------------------------------------------------------------------------
-// Trailing-dot FQDN consistency (F-11 fix)
+// Trailing-dot FQDN consistency
 // ---------------------------------------------------------------------------
 
 describe("Cache key trailing-dot canonicalization", () => {

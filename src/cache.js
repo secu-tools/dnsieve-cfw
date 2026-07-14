@@ -5,20 +5,13 @@
 // Cache key design - unified name+type format for all request types:
 //   https://doh-cache.internal/{profileId}/json/{name}/{type}
 //
-// Using the same key format for JSON GET, wire GET (?dns=), and wire POST
-// ensures that:
-//   1. A DO=0 client and a DO=1 client for the same query share the same
-//      cache entry (the proxy always requests DO=1 upstream, so the cached
-//      response always contains DNSSEC records).
-//   2. The same domain queried via different DoH request formats hits the
-//      same cache entry, improving hit rates.
-//
-// Wire GET and POST: the question name and type are extracted from the decoded
-// wire message, normalised with toASCII and normalizeType, and used as the
-// canonical key. Falls back to a SHA-256 hash key for malformed queries that
-// cannot be parsed.
-//
-// RFC 8484 SS.4.1: DNS transaction ID is always 0 in cached messages.
+// JSON GET, wire GET (?dns=), and wire POST share the same key format, so
+// DO=0/DO=1 clients and different request formats for the same query all hit
+// one cache entry (the proxy always requests DO=1 upstream, so cached
+// responses always contain DNSSEC records). For wire requests the question
+// name and type are extracted from the decoded message and normalised
+// (toASCII / normalizeType); malformed queries fall back to a SHA-256 hash
+// key. DNS transaction ID is always 0 in cached messages (RFC 8484 SS.4.1).
 
 import { HEX_TABLE, toASCII, normalizeType, stripBase64Padding, extractMinTtlWire, extractMinTtl, extractQueryNameType, DNS_NUMBER_TO_TYPE } from "./dns.js";
 import {

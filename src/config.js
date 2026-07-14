@@ -40,8 +40,8 @@ export const UPSTREAM_COUNT = UPSTREAM_SERVERS.length;
 
 export const MAX_DNS_MESSAGE_SIZE = 65535;
 
-// Set to false before production deployment to suppress verbose console.log
-// output visible in `wrangler tail`.
+// Verbose console.log output visible via `wrangler tail`. Keep false in
+// production: debug logs include query details.
 export const DEBUG = false;
 
 // ---------------------------------------------------------------------------
@@ -86,45 +86,22 @@ export const BLOCKING_MODE = "null";
 // Cache renewal - stale-while-revalidate background refresh
 // ---------------------------------------------------------------------------
 // Percentage (0-99) of the original worker-side TTL that, when remaining,
-// triggers a background upstream refresh via ctx.waitUntil() while the still-
-// valid cached entry is returned to the client immediately.
-// Set to 0 to disable proactive refresh entirely.
-// Example: 10 refreshes when <= 10% of the original TTL remains
-//   (a 1800-second entry refreshes at 180 seconds remaining).
+// triggers a background upstream refresh while the cached entry is still
+// served to the client. 0 disables proactive refresh.
 export const CACHE_RENEW_PERCENT = 10;
 
 // Wire-format blocked responses always include an EDE (RFC 8914) option with
-// info code 15 (Blocked) and extra text derived from the blocking upstream URL:
-//   "Blocked (https://upstream.url/dns-query)"
-// This behaviour is not configurable.
+// info code 15 (Blocked) naming the blocking upstream. Not configurable.
 
 // ---------------------------------------------------------------------------
 // Runtime config factory - merges CF Workers env bindings with the defaults above.
 // ---------------------------------------------------------------------------
 
 /**
- * Build a runtime configuration object from CF Workers env bindings.
- * Every field falls back to the module-level default when the binding is absent.
- *
- * Supported bindings (all string-typed in wrangler.toml [vars]):
- *   GENERAL_PROFILE_ID               - 6-hex-char fallback profile ID
- *   MIN_WAIT_MS                      - number (ms)
- *   UPSTREAM_TIMEOUT_MS              - number (ms)
- *   MIN_CACHE_TTL_FLOOR              - number (s)
- *   WORKER_CACHE_TTL_SECONDS         - number (s)
- *   WORKER_BLOCKED_CACHE_TTL_SECONDS - number (s)
- *   CLIENT_CACHE_TTL_SECONDS         - number (s)
- *   CLIENT_BLOCKED_CACHE_TTL_SECONDS - number (s)
- *   UPSTREAM_SERVERS                 - JSON array, e.g. '["https://...","https://..."]'
- *   MAX_DNS_MESSAGE_SIZE             - number
- *   DEBUG                            - "true" to enable verbose console.log output
- *   PRIVACY_ECS_MODE                 - "strip", "forward", or "substitute"
- *   PRIVACY_ECS_SUBNET               - CIDR string, e.g. "203.0.113.0/24" (substitute mode)
- *   PRIVACY_COOKIES_MODE             - "strip" or "reoriginate"
- *   PRIVACY_NSID_MODE                - "strip", "forward", or "substitute"
- *   PRIVACY_NSID_VALUE               - Identifier string returned in substitute mode
- *   BLOCKING_MODE                    - "null", "nxdomain", "nodata", or "refused"
- *   CACHE_RENEW_PERCENT              - number (0-99, percentage of TTL remaining triggering background refresh, 0 = off)
+ * Build a runtime configuration object from CF Workers env bindings
+ * (wrangler.toml [vars] / dashboard variables; all bindings are strings).
+ * Every field falls back to the module-level default when the binding is
+ * absent. See README.md for the full variable reference.
  *
  * @param {object} [env={}] CF Workers env bindings
  * @returns {object} Runtime configuration

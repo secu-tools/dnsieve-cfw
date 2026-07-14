@@ -124,7 +124,7 @@ describe("Blocked response with EDE", () => {
   });
 
   it("EDE text is retrievable from the response", () => {
-    const edeText = "Blocked (https://test.upstream.com/dns-query)";
+    const edeText = "Blocked (https://upstream.example.net/dns-query)";
     const query = buildDnsQuery("malware.example.com", 1);
     const resp = buildBlockedResponse(query, "null", { edeText });
     // The EDE text should be embedded in the wire response

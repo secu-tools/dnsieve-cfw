@@ -66,17 +66,10 @@ export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
 }
 
 /**
- * Apply client-specific per-response EDNS patching: optional DNSSEC stripping
- * for non-DO clients, optional NSID injection (substitute mode), and DNS
- * transaction ID restore.  A single body-read covers all wire-format operations.
- *
- * Stripping rules (RFC 4035 Section 3.1.4.1):
- *   When clientWantsDo is false, RRSIG/NSEC/DNSKEY/NSEC3 records are removed
- *   from the Answer and Authority sections before the response is sent.
- *   Exception: a DNSSEC type is kept in the Answer when it equals queryQtype
- *   (the client explicitly queried for that type).
- *
- * nsidValue is null when no injection is needed.
+ * Apply client-specific per-response EDNS patching: DNSSEC stripping for
+ * non-DO clients (RFC 4035 Section 3.1.4.1, see stripDnssecFromWire), NSID
+ * injection (substitute mode; nsidValue is null when not needed), and DNS
+ * transaction ID restore. A single body-read covers all wire operations.
  *
  * @param {Response} response
  * @param {number} dnsId
@@ -321,22 +314,18 @@ export async function handleRequest(request, env, ctx) {
 
   let bodyBytes = null;
   let clientDnsId = 0;
-  // wireGetQueryBytes: decoded wire bytes from a GET ?dns= request. Kept
-  // separate from bodyBytes to avoid affecting buildCacheKey (which derives
-  // the wire GET cache key directly from the URL parameter, not the body).
-  // Used only in the all-fail SERVFAIL response builder (RFC 8484 s4.2.1).
+  // Decoded wire bytes from a GET ?dns= request. Kept separate from bodyBytes
+  // so buildCacheKey (which keys wire GET off these decoded bytes) is not
+  // confused with the POST path.
   let wireGetQueryBytes = null;
-  // clientWantsDo: whether the originating client requested DNSSEC records.
-  // When false, DNSSEC RRs are stripped from responses before returning
-  // (RFC 4035 Section 3.1.4.1). Upstreams always receive DO=1 regardless.
+  // Whether the client requested DNSSEC records; when false, DNSSEC RRs are
+  // stripped from responses (RFC 4035 S3.1.4.1). Upstreams always get DO=1.
   let clientWantsDo = false;
-  // clientCd: whether the client requested Checking Disabled (RFC 4035 S3.1.6).
-  // For wire requests the CD bit is preserved directly in the wire bytes;
-  // for JSON DoH it is sourced from the ?cd=1 query parameter.
+  // Checking Disabled (RFC 4035 S3.1.6): preserved in the wire bytes for wire
+  // requests; sourced from ?cd=1 for JSON DoH.
   let clientCd = false;
-  // queryQtype: numeric DNS type from the first question. Used as the DNSSEC
-  // strip exception -- a type is kept in Answer even for non-DO clients when it
-  // equals the explicitly queried type (e.g. ?type=RRSIG keeps RRSIG answers).
+  // Numeric DNS type of the first question: the DNSSEC strip exception keeps
+  // this type in Answer even for non-DO clients (e.g. ?type=RRSIG).
   let queryQtype = 1; // default A
 
   if (isWirePost) {
@@ -386,17 +375,12 @@ export async function handleRequest(request, env, ctx) {
       return new Response("Bad Request. DNS message in ?dns= parameter is too short.", { status: 400, headers: { "Content-Type": "text/plain", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } });
     }
     if (decoded.length >= 2) clientDnsId = (decoded[0] << 8) | decoded[1];
-    // RFC 8484 SS.4.1: zero the DNS ID (same as the POST path). Responses built
-    // from these bytes may be written to the shared edge cache, and cached
+    // RFC 8484 SS.4.1: zero the DNS ID (same as the POST path) -- cached
     // messages must never carry one client's transaction ID; applyClientEdns
     // restores the original ID on the direct reply.
     if (decoded.length >= 2 && (decoded[0] !== 0 || decoded[1] !== 0)) {
       decoded[0] = 0; decoded[1] = 0;
     }
-    // Save decoded bytes so the all-fail path can build a SERVFAIL response
-    // mirroring the question section (RFC 8484 s4.2.1). Not assigned to
-    // bodyBytes to avoid interfering with buildCacheKey, which derives wire GET
-    // cache keys from these decoded bytes (or the URL ?dns= param as fallback).
     wireGetQueryBytes = decoded;
     clientWantsDo = hasDoBit(decoded);
     const getMeta = extractQueryNameType(decoded);
@@ -509,13 +493,9 @@ export async function handleRequest(request, env, ctx) {
     return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype);
   }
 
-  // All upstreams failed.
-  // RFC 8484 s4.2.1: a valid DNS response -- even SERVFAIL -- MUST be returned
-  // with HTTP 200. Build a synthetic SERVFAIL reply from the original query so
-  // the client can correlate the response with its question. Cache-Control is
-  // set to no-store so neither the edge cache nor the client caches the error
-  // (RFC 2308: SERVFAIL SHOULD NOT be cached; RFC 8484 s5.1: freshness lifetime
-  // must not exceed the smallest TTL in the Answer section -- SERVFAIL has none).
+  // All upstreams failed: build a synthetic SERVFAIL from the original query,
+  // returned with HTTP 200 (RFC 8484 s4.2.1) and Cache-Control: no-store so
+  // the error is never cached (RFC 2308).
   if (cfg.DEBUG) console.log(`[DoH] All ${cfg.UPSTREAM_COUNT} upstreams failed (SERVFAIL) profileId=${profileId}`);
 
   const servfailHeaders = { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*", "Vary": "Accept", "X-Profile-Id": profileId, "X-Worker-Version": VERSION };
