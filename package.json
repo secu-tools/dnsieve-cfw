@@ -19,10 +19,10 @@
     "lint": "eslint src"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.14.2",
-    "@cloudflare/workers-types": "^4.20250408.0",
-    "@vitest/coverage-v8": "^4.1.3",
-    "vitest": "^4.1.3",
-    "wrangler": "^4.11.0"
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
+    "@cloudflare/workers-types": "^5.20260714.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.110.0"
   }
 }
