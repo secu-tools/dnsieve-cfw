@@ -950,6 +950,88 @@ export function extractMinTtl(json) {
   return min === Infinity ? null : min;
 }
 
+// Coerce a TTL into the 0..2^31-1 range DNS allows (RFC 2181 Section 8).
+// Config values arrive as bare Number(env.X), so non-integers are possible.
+function clampTtl(ttl) {
+  return Math.max(0, Math.min(0x7fffffff, Math.floor(ttl)));
+}
+
+/**
+ * Rewrite every resource-record TTL in a DNS wire response to `ttl`.
+ *
+ * OS-level DoH clients cache on the record TTL and ignore Cache-Control, so the
+ * message body is the only place this value takes effect. Answer, Authority and
+ * Additional are rewritten; the OPT pseudo-record (type 41) is skipped because
+ * RFC 6891 Section 6.1.3 repurposes its TTL field as rcode/version/flags.
+ *
+ * Returns the buffer unchanged when it is too short or cannot be parsed.
+ *
+ * @param {Uint8Array} buf - DNS wire response
+ * @param {number} ttl - TTL in seconds
+ * @returns {Uint8Array}
+ */
+export function setTtlWire(buf, ttl) {
+  if (!buf || buf.length < 12) return buf;
+  const value = clampTtl(ttl);
+  try {
+    const qdcount = (buf[4] << 8) | buf[5];
+    const ancount = (buf[6] << 8) | buf[7];
+    const nscount = (buf[8] << 8) | buf[9];
+    const arcount = (buf[10] << 8) | buf[11];
+
+    let off = 12;
+    for (let q = 0; q < qdcount; q++) { off = skipName(buf, off); off += 4; }
+
+    const b1 = (value >>> 24) & 0xff, b2 = (value >>> 16) & 0xff;
+    const b3 = (value >>> 8) & 0xff,  b4 = value & 0xff;
+
+    // Copy lazily: when every record already carries the target TTL the input
+    // is returned as-is. The input is never written to.
+    let out = buf;
+    const total = ancount + nscount + arcount;
+    for (let r = 0; r < total; r++) {
+      off = skipName(out, off);
+      if (off + 10 > out.length) break;
+      const rrtype = (out[off] << 8) | out[off + 1];
+      // RFC 6891 S.6.1.3: OPT reuses the TTL field for rcode/version/flags.
+      if (rrtype !== 41 &&
+          (out[off + 4] !== b1 || out[off + 5] !== b2 ||
+           out[off + 6] !== b3 || out[off + 7] !== b4)) {
+        if (out === buf) out = new Uint8Array(buf);
+        out[off + 4] = b1;
+        out[off + 5] = b2;
+        out[off + 6] = b3;
+        out[off + 7] = b4;
+      }
+      const rdlength = (out[off + 8] << 8) | out[off + 9];
+      off += 10 + rdlength;
+    }
+    return out;
+  } catch { return buf; }
+}
+
+/**
+ * Rewrite every record TTL in a JSON DoH response to `ttl`.
+ * Mirrors setTtlWire for the application/dns-json representation.
+ *
+ * @param {object} json - Parsed JSON DoH response
+ * @param {number} ttl - TTL in seconds
+ * @returns {object} A new object; the input is not mutated.
+ */
+export function setTtlJson(json, ttl) {
+  if (!json || typeof json !== "object") return json;
+  const value = clampTtl(ttl);
+  const out = { ...json };
+  for (const section of ["Answer", "Authority", "Additional"]) {
+    const rrs = out[section];
+    if (!Array.isArray(rrs)) continue;
+    out[section] = rrs.map(rr => (rr && typeof rr === "object" && typeof rr.TTL === "number")
+      ? { ...rr, TTL: value }
+      : rr);
+  }
+  return out;
+}
+
 // Returns the minimum TTL from a DNS wire response by scanning Answer + Authority RRs.
 export function extractMinTtlWire(buf) {
   if (buf.length < 12) return null;
@@ -1308,7 +1390,7 @@ export function buildBlockedResponse(queryBuf, mode, opts = {}) {
         answerSection[w++] = 0x00; answerSection[w++] = 0x1c; // TYPE AAAA
         answerSection[w++] = 0x00; answerSection[w++] = 0x01; // CLASS IN
         answerSection[w++] = 0x00; answerSection[w++] = 0x00;
-        answerSection[w++] = 0x00; answerSection[w++] = 0x00; // TTL=0
+        answerSection[w++] = 0x00; answerSection[w++] = 0x00; // TTL=0; stamped by setTtlWire at egress
         answerSection[w++] = 0x00; answerSection[w++] = 0x10; // RDLENGTH=16
         // 16 zero bytes for ::
         ancount = 1;
@@ -1320,7 +1402,7 @@ export function buildBlockedResponse(queryBuf, mode, opts = {}) {
         answerSection[w++] = 0x00; answerSection[w++] = 0x01; // TYPE A
         answerSection[w++] = 0x00; answerSection[w++] = 0x01; // CLASS IN
         answerSection[w++] = 0x00; answerSection[w++] = 0x00;
-        answerSection[w++] = 0x00; answerSection[w++] = 0x00; // TTL=0
+        answerSection[w++] = 0x00; answerSection[w++] = 0x00; // TTL=0; stamped by setTtlWire at egress
         answerSection[w++] = 0x00; answerSection[w++] = 0x04; // RDLENGTH=4
         // 4 zero bytes for 0.0.0.0
         ancount = 1;

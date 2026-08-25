@@ -200,7 +200,12 @@ describe("computeClientTtl", () => {
     expect(computeClientTtl(result, false)).toBe(1800);
   });
 
-  it("caps blocked result TTL to DNS record TTL when lower than configured", () => {
+  // A block is a policy verdict, not a property of the record, so the upstream
+  // record TTL must not cap it. Previously the upstream's own short TTL on a
+  // blocked reply (commonly 60s) made CLIENT_BLOCKED_CACHE_TTL_SECONDS
+  // unreachable, so every blocked lookup went back over the network even though
+  // this worker serves the same verdict from its edge cache for a full day.
+  it("uses the configured blocked TTL regardless of the upstream record TTL", () => {
     const result = {
       wire: false,
       json: {
@@ -208,7 +213,32 @@ describe("computeClientTtl", () => {
         Answer: [{ TTL: 120, data: "0.0.0.0" }],
       },
     };
-    expect(computeClientTtl(result, true)).toBe(120);
+    expect(computeClientTtl(result, true)).toBe(86400);
+  });
+
+  it("still honours a lower configured blocked TTL", () => {
+    const result = { wire: false, json: { Status: 0, Answer: [{ TTL: 120, data: "0.0.0.0" }] } };
+    const cfg = {
+      CLIENT_BLOCKED_CACHE_TTL_SECONDS: 600,
+      CLIENT_CACHE_TTL_SECONDS: 1800,
+      MIN_CACHE_TTL_FLOOR: 60,
+    };
+    expect(computeClientTtl(result, true, cfg)).toBe(600);
+  });
+
+  it("floors the blocked TTL at MIN_CACHE_TTL_FLOOR", () => {
+    const result = { wire: false, json: { Status: 0, Answer: [{ TTL: 120, data: "0.0.0.0" }] } };
+    const cfg = {
+      CLIENT_BLOCKED_CACHE_TTL_SECONDS: 5,
+      CLIENT_CACHE_TTL_SECONDS: 1800,
+      MIN_CACHE_TTL_FLOOR: 60,
+    };
+    expect(computeClientTtl(result, true, cfg)).toBe(60);
+  });
+
+  it("still caps a NON-blocked result at the upstream record TTL", () => {
+    const result = { wire: false, json: { Status: 0, Answer: [{ TTL: 120, data: "1.2.3.4" }] } };
+    expect(computeClientTtl(result, false)).toBe(120);
   });
 
   it("applies MIN_CACHE_TTL_FLOOR for very small wire TTL values", () => {

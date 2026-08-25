@@ -157,12 +157,25 @@ export function shouldRenewCache(response, cfg) {
   return remaining < totalTtl * renewPercent / 100;
 }
 
-// Returns the effective client-side TTL: min(configured, dns_record_ttl) floored at MIN_CACHE_TTL_FLOOR.
+// Returns the effective client-side TTL, floored at MIN_CACHE_TTL_FLOOR.
+//
+// Normal answers are capped by the upstream record TTL, so a client is never
+// told to hold an answer longer than its origin considers valid.
+//
+// Blocked answers ignore that cap: a block is a policy verdict, not a property
+// of the record, and blocking upstreams return one with a short TTL. The worker
+// serves the verdict from its edge cache for WORKER_BLOCKED_CACHE_TTL_SECONDS
+// anyway, so re-asking sooner costs a round trip for identical bytes. See the
+// Cache TTLs section of README.md for the staleness trade-off.
 export function computeClientTtl(result, isBlocked, cfg) {
-  const c = isBlocked
-    ? (cfg ? cfg.CLIENT_BLOCKED_CACHE_TTL_SECONDS : CLIENT_BLOCKED_CACHE_TTL_SECONDS)
-    : (cfg ? cfg.CLIENT_CACHE_TTL_SECONDS         : CLIENT_CACHE_TTL_SECONDS);
   const floor = cfg ? cfg.MIN_CACHE_TTL_FLOOR : MIN_CACHE_TTL_FLOOR;
+
+  if (isBlocked) {
+    const b = cfg ? cfg.CLIENT_BLOCKED_CACHE_TTL_SECONDS : CLIENT_BLOCKED_CACHE_TTL_SECONDS;
+    return Math.max(b, floor);
+  }
+
+  const c = cfg ? cfg.CLIENT_CACHE_TTL_SECONDS : CLIENT_CACHE_TTL_SECONDS;
   const dns = result.wire ? extractMinTtlWire(result.raw) : (result.json ? extractMinTtl(result.json) : null);
   return Math.max(dns != null ? Math.min(c, dns) : c, floor);
 }

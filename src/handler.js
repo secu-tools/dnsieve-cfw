@@ -15,7 +15,7 @@ import {
   GENERAL_PROFILE_ID,
   getConfig,
 } from "./config.js";
-import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, buildServfailResponse } from "./dns.js";
+import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, buildServfailResponse, setTtlWire, setTtlJson } from "./dns.js";
 import { buildUpstreamUrl, queryUpstream } from "./upstream.js";
 import { buildCacheKey, putCache, computeClientTtl, shouldRenewCache } from "./cache.js";
 import { VERSION } from "./version.js";
@@ -49,6 +49,10 @@ function dohWireHeaders(extra) {
 
 export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
   const ttl = computeClientTtl(result, isBlocked, cfg);
+  // X-Client-Cache-TTL is the client's cache budget from the moment this
+  // response was produced. The body keeps the upstream record TTLs: the same
+  // message is also stored in the edge cache and replayed, and a record TTL is
+  // a countdown from now. applyClientEdns stamps the body at egress instead.
   const extra = {
     "Cache-Control": `public, max-age=${ttl}`,
     "X-Profile-Id": profileId,
@@ -65,6 +69,31 @@ export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
   return new Response(JSON.stringify(result.json), { status: 200, headers: dohJsonHeaders(extra) });
 }
 
+// Remaining client TTL, in seconds: the budget recorded at build time
+// (X-Client-Cache-TTL) minus the entry's age in the edge cache
+// (X-Cache-Inserted-At, absent on a fresh response). Without the subtraction a
+// nearly expired entry would hand out a full-length TTL, letting total
+// staleness reach the worker TTL plus the client TTL.
+//
+// Returns null when no budget is recorded, meaning "leave the body alone".
+export function remainingClientTtl(headers, cfg) {
+  // Values come from headers or bare Number(env.X) config, so each is coerced:
+  // a NaN reaching setTtlWire is written to the wire as TTL=0, which silently
+  // reinstates the "never cache" behaviour this function exists to prevent.
+  const budget = Number(headers.get("x-client-cache-ttl"));
+  if (!Number.isFinite(budget) || budget <= 0) return null;
+
+  const floor = Number(cfg?.MIN_CACHE_TTL_FLOOR);
+  const safeFloor = Number.isFinite(floor) && floor > 0 ? floor : 0;
+
+  const insertedAt = Number(headers.get("x-cache-inserted-at"));
+  if (!Number.isFinite(insertedAt) || insertedAt <= 0) return budget;
+
+  const age = Math.floor(Date.now() / 1000) - insertedAt;
+  if (age <= 0) return budget;
+  return Math.max(safeFloor, budget - age);
+}
+
 /**
  * Apply client-specific per-response EDNS patching: DNSSEC stripping for
  * non-DO clients (RFC 4035 Section 3.1.4.1, see stripDnssecFromWire), NSID
@@ -78,10 +107,14 @@ export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
  * @param {number} queryQtype
  * @returns {Promise<Response>}
  */
-async function applyClientEdns(response, dnsId, nsidValue, clientWantsDo, queryQtype) {
+async function applyClientEdns(response, dnsId, nsidValue, clientWantsDo, queryQtype, cfg) {
   const ct = response.headers.get("content-type") || "";
+  const ttl = remainingClientTtl(response.headers, cfg);
+
   if (ct.includes("dns-message")) {
-    if (dnsId === 0 && nsidValue === null && clientWantsDo) return response;
+    if (dnsId === 0 && nsidValue === null && clientWantsDo && ttl === null) {
+      return new Response(response.body, { status: response.status, headers: clientHeaders(response.headers, null) });
+    }
     let buf = new Uint8Array(await response.arrayBuffer());
     if (!clientWantsDo) {
       buf = stripDnssecFromWire(buf, queryQtype);
@@ -90,18 +123,40 @@ async function applyClientEdns(response, dnsId, nsidValue, clientWantsDo, queryQ
       buf = clearDoBitInResponse(buf);
     }
     if (nsidValue !== null) buf = injectNsidToResponse(buf, nsidValue);
+    if (ttl !== null) buf = setTtlWire(buf, ttl);
     if (dnsId !== 0 && buf.length >= 2) { buf[0] = (dnsId >> 8) & 0xff; buf[1] = dnsId & 0xff; }
-    return new Response(buf, { status: response.status, headers: response.headers });
+    return new Response(buf, { status: response.status, headers: clientHeaders(response.headers, ttl) });
   }
-  if (ct.includes("dns-json") && !clientWantsDo) {
+
+  if (ct.includes("dns-json") && (!clientWantsDo || ttl !== null)) {
     // JSON path: strip DNSSEC records for non-DO clients.
     // We must always rebuild the Response here because response.json() consumes
     // the body stream regardless of whether any records are actually removed.
-    const json = await response.json();
-    const stripped = stripDnssecFromJson(json, queryQtype);
-    return new Response(JSON.stringify(stripped), { status: response.status, headers: response.headers });
+    let json = await response.json();
+    if (!clientWantsDo) json = stripDnssecFromJson(json, queryQtype);
+    if (ttl !== null) json = setTtlJson(json, ttl);
+    return new Response(JSON.stringify(json), { status: response.status, headers: clientHeaders(response.headers, ttl) });
   }
-  return response;
+  return new Response(response.body, { status: response.status, headers: clientHeaders(response.headers, ttl) });
+}
+
+// Headers for a response leaving the worker. putCache stores entries with the
+// worker-side Cache-Control, so a cache hit must re-derive the client value
+// from the same TTL stamped into the body, keeping header and records in step.
+function clientHeaders(headers, ttl) {
+  const out = new Headers(headers);
+
+  // Edge-cache bookkeeping must not reach the client: the cache is shared per
+  // profile, so an insertion timestamp reveals when somebody else first looked
+  // up that domain.
+  out.delete("X-Cache-Inserted-At");
+  out.delete("X-Worker-Cache-TTL");
+
+  if (ttl !== null) {
+    out.set("Cache-Control", `public, max-age=${ttl}`);
+    out.set("X-Client-Cache-TTL", String(ttl));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,8 +209,9 @@ function buildBlockedResponseForClient(blockedResult, profileId, upstreamUrls, b
 
   if (isJsonGet) {
     // JSON blocking response
-    const json = buildBlockedJson(blockedResult, mode, edeText, clientCd);
     const ttl = computeClientTtl(blockedResult, true, cfg);
+    // Stamped once at egress, so the cached copy holds no time-relative value.
+    const json = buildBlockedJson(blockedResult, mode, edeText, clientCd);
     return new Response(JSON.stringify(json), {
       status: 200,
       headers: dohJsonHeaders({
@@ -172,8 +228,9 @@ function buildBlockedResponseForClient(blockedResult, profileId, upstreamUrls, b
 
   // Wire blocking response
   if (bodyBytes && bodyBytes.length >= 12) {
-    const wireResp = buildBlockedResponse(bodyBytes, mode, { edeText });
     const ttl = computeClientTtl(blockedResult, true, cfg);
+    // As above: TTL=0 here, stamped at egress where the entry's age is known.
+    const wireResp = buildBlockedResponse(bodyBytes, mode, { edeText });
     return new Response(wireResp, {
       status: 200,
       headers: dohWireHeaders({
@@ -227,6 +284,35 @@ function buildBlockedJson(blockedResult, mode, edeText, clientCd = false) {
 // ---------------------------------------------------------------------------
 // Background cache refresh (stale-while-revalidate)
 // ---------------------------------------------------------------------------
+
+// Cache keys with a background refresh already running in this isolate.
+//
+// Without this guard every request served from cache during the renewal window
+// (the last CACHE_RENEW_PERCENT of the worker TTL) starts its own full upstream
+// fan-out. A domain queried even a few times per second therefore produces
+// hundreds of redundant refreshes -- and N times that many upstream
+// subrequests -- where one would do.
+// Scope note: this is per-isolate, and a colo runs many isolates, so a very hot
+// key can still produce one refresh per isolate rather than one globally. That
+// is a large constant-factor win over one per request and needs no coordination;
+// cross-isolate coalescing would require a cache-backed sentinel.
+//
+// Exported so tests can inspect and reset it between cases, matching
+// COOKIE_STORE in upstream.js.
+export const INFLIGHT_REFRESH = new Set();
+
+// Starts a background refresh for the given cache key unless one is already
+// running. Returns true when a refresh was started.
+function startBackgroundRefresh(ctx, key, run) {
+  if (INFLIGHT_REFRESH.has(key)) return false;
+  INFLIGHT_REFRESH.add(key);
+  ctx.waitUntil((async () => {
+    // run() builds its upstream list eagerly and so can throw synchronously.
+    try { await run(); } catch { /* best-effort */ }
+    finally { INFLIGHT_REFRESH.delete(key); }
+  })());
+  return true;
+}
 
 // Re-queries all upstreams and writes the freshest result back to the edge
 // cache.  Called via ctx.waitUntil() after a stale-but-valid cached response
@@ -417,11 +503,14 @@ export async function handleRequest(request, env, ctx) {
     if (cfg.DEBUG) console.log(`[DoH] Cache HIT  profileId=${profileId}`);
     // Stale-while-revalidate: refresh in the background when remaining TTL is low.
     if (cfg.CACHE_RENEW_PERCENT > 0 && shouldRenewCache(cached, cfg)) {
-      if (cfg.DEBUG) console.log(`[DoH] Cache renew triggered  profileId=${profileId}`);
-      const renewUrls = cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId));
-      ctx.waitUntil(backgroundRefreshCache(cache, cacheKey, request, url, bodyBytes, wireGetQueryBytes, isJsonGet, profileId, renewUrls, cfg));
+      // Built inside the callback so it is only materialised when a refresh
+      // actually starts; most hits in the renewal window are deduplicated.
+      const started = startBackgroundRefresh(ctx, cacheKey.url, () =>
+        backgroundRefreshCache(cache, cacheKey, request, url, bodyBytes, wireGetQueryBytes, isJsonGet, profileId,
+          cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId)), cfg));
+      if (cfg.DEBUG) console.log(`[DoH] Cache renew ${started ? "triggered" : "skipped (already in flight)"}  profileId=${profileId}`);
     }
-    return applyClientEdns(cached, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype);
+    return applyClientEdns(cached, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
   }
   if (cfg.DEBUG) console.log(`[DoH] Cache MISS - querying ${cfg.UPSTREAM_COUNT} upstreams`);
 
@@ -457,7 +546,7 @@ export async function handleRequest(request, env, ctx) {
     if (cfg.DEBUG) console.log(`[DoH] Early BLOCKED from upstream[${blocked.index}] (${upstreamUrls[blocked.index]})`);
     const resp = buildBlockedResponseForClient(blocked, profileId, upstreamUrls, bodyBytes || wireGetQueryBytes, isJsonGet, cfg, clientCd);
     ctx.waitUntil(Promise.allSettled(promises));
-    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype);
+    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
   }
 
   // Phase 2: wait for all upstreams to finish
@@ -480,7 +569,7 @@ export async function handleRequest(request, env, ctx) {
       if (cfg.DEBUG) console.log(`[DoH] BLOCKED by upstream[${r.index}] (${upstreamUrls[r.index]})  allResponded=${allResponded}`);
       const resp = buildBlockedResponseForClient(r, profileId, upstreamUrls, bodyBytes || wireGetQueryBytes, isJsonGet, cfg, clientCd);
       if (allResponded) ctx.waitUntil(putCache(cache, cacheKey, resp.clone(), true, cfg));
-      return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype);
+      return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
     }
   }
 
@@ -490,7 +579,7 @@ export async function handleRequest(request, env, ctx) {
     if (cfg.DEBUG) console.log(`[DoH] OK from upstream[${best.index}] (${upstreamUrls[best.index]})  hasDnssec=${!!best.hasDnssec}  allResponded=${allResponded}`);
     const resp = buildResponse(best, profileId, false, allResponded, cfg);
     if (allResponded) ctx.waitUntil(putCache(cache, cacheKey, resp.clone(), false, cfg));
-    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype);
+    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
   }
 
   // All upstreams failed: build a synthetic SERVFAIL from the original query,
@@ -512,5 +601,5 @@ export async function handleRequest(request, env, ctx) {
   const queryBytesForServfail = bodyBytes || wireGetQueryBytes || null;
   const servfailWire = buildServfailResponse(queryBytesForServfail);
   const servfailResp = new Response(servfailWire, { status: 200, headers: { ...servfailHeaders, "Content-Type": "application/dns-message" } });
-  return applyClientEdns(servfailResp, clientDnsId, null, clientWantsDo, queryQtype);
+  return applyClientEdns(servfailResp, clientDnsId, null, clientWantsDo, queryQtype, cfg);
 }

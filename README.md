@@ -123,11 +123,25 @@ UPSTREAM_SERVERS = '["https://dns.quad9.net/dns-query","https://security.cloudfl
 | `MIN_CACHE_TTL_FLOOR` | `"60"` | Absolute minimum TTL (seconds) for both edge and client caches |
 | `WORKER_CACHE_TTL_SECONDS` | `"1800"` | Edge cache TTL for normal responses |
 | `WORKER_BLOCKED_CACHE_TTL_SECONDS` | `"86400"` | Edge cache TTL for blocked / NXDOMAIN responses |
-| `CLIENT_CACHE_TTL_SECONDS` | `"1800"` | `Cache-Control: max-age` for normal responses |
-| `CLIENT_BLOCKED_CACHE_TTL_SECONDS` | `"86400"` | `Cache-Control: max-age` for blocked responses |
+| `CLIENT_CACHE_TTL_SECONDS` | `"1800"` | Client cache TTL for normal responses |
+| `CLIENT_BLOCKED_CACHE_TTL_SECONDS` | `"86400"` | Client cache TTL for blocked responses |
 | `CACHE_RENEW_PERCENT` | `"10"` | Remaining-TTL percentage that triggers a background refresh (0 = off) |
 
-The actual TTL is `min(configured_ttl, dns_record_ttl)`, floored at `MIN_CACHE_TTL_FLOOR`.
+The client TTL is written to both `Cache-Control: max-age` and the record TTLs in
+the response body. OS-level DoH clients (including the iOS/macOS encrypted-DNS
+profile resolver) cache on the record TTL and ignore `Cache-Control`, so the body
+is what actually takes effect for them. Cached responses have their age subtracted,
+so a client is never handed more than the remaining budget.
+
+- **Normal responses:** `min(CLIENT_CACHE_TTL_SECONDS, dns_record_ttl)`, floored at
+  `MIN_CACHE_TTL_FLOOR`.
+- **Blocked responses:** `CLIENT_BLOCKED_CACHE_TTL_SECONDS`, floored at
+  `MIN_CACHE_TTL_FLOOR`. The record TTL is not applied as a cap here, since a block
+  is a policy verdict rather than a property of the record.
+
+  Trade-off: a domain removed from a blocklist stays blocked on clients that already
+  cached the verdict until it expires. Lower `CLIENT_BLOCKED_CACHE_TTL_SECONDS` to
+  shorten that window.
 
 ### Background cache refresh (stale-while-revalidate)
 
@@ -221,7 +235,7 @@ POST /dns-query                                Content-Type: application/dns-mes
 | `X-Blocking-Mode` | `null` | Blocking mode used (only on blocked responses) |
 | `X-Upstream-Index` | `0` | Index of the upstream that provided the result |
 | `X-All-Responded` | `true` | Whether all upstreams responded before the result was returned |
-| `X-Client-Cache-TTL` | `1800` | The `max-age` value written into `Cache-Control` |
+| `X-Client-Cache-TTL` | `1800` | Client TTL, written into both `Cache-Control: max-age` and the record TTLs in the response body |
 | `X-Worker-Version` | `1.0.0` | Version of the deployed worker |
 | `X-Worker-Cache-TTL` | `1800` | (cached copies only) Edge cache TTL applied by the worker |
 | `X-Cache-Inserted-At` | `1713220800` | (cached copies only) Unix timestamp when the entry was cached |
