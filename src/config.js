@@ -11,8 +11,14 @@ export const MIN_WAIT_MS = 200;
 // Per-upstream fetch timeout; timed-out upstreams are treated as failed
 export const UPSTREAM_TIMEOUT_MS = 1500;
 
-// Absolute minimum TTL applied to both edge and client caches
-export const MIN_CACHE_TTL_FLOOR = 60;
+// Absolute minimum TTL applied to both edge and client caches.
+//
+// Short upstream TTLs (CDN records are routinely 5-60s) otherwise make clients
+// re-query every few seconds for an answer the edge cache already holds for
+// WORKER_CACHE_TTL_SECONDS. Raising the floor to 10 minutes cuts that traffic
+// on metered mobile and IoT links, at the cost of following a genuine record
+// change that much later.
+export const MIN_CACHE_TTL_FLOOR = 600;
 
 // Edge cache TTL for normal (non-blocked) responses
 export const WORKER_CACHE_TTL_SECONDS = 1800;
@@ -36,7 +42,6 @@ export const UPSTREAM_SERVERS = [
   "https://security.cloudflare-dns.com/dns-query",
 ];
 
-export const UPSTREAM_COUNT = UPSTREAM_SERVERS.length;
 
 export const MAX_DNS_MESSAGE_SIZE = 65535;
 
@@ -106,6 +111,15 @@ export const CACHE_RENEW_PERCENT = 10;
  * @param {object} [env={}] CF Workers env bindings
  * @returns {object} Runtime configuration
  */
+// Numeric env values fall back to the module default when they do not parse.
+// A NaN reaching a consumer is silently destructive: NaN as UPSTREAM_TIMEOUT_MS
+// aborts every fetch on the first tick (SERVFAIL for every query), and NaN as
+// MAX_DNS_MESSAGE_SIZE disables both size gates, since any `x > NaN` is false.
+function num(value, fallback) {
+  const n = Number(value ?? fallback);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export function getConfig(env = {}) {
   let servers = UPSTREAM_SERVERS;
   if (env.UPSTREAM_SERVERS) {
@@ -117,16 +131,16 @@ export function getConfig(env = {}) {
 
   return {
     GENERAL_PROFILE_ID:               env.GENERAL_PROFILE_ID               ?? GENERAL_PROFILE_ID,
-    MIN_WAIT_MS:                       Number(env.MIN_WAIT_MS                ?? MIN_WAIT_MS),
-    UPSTREAM_TIMEOUT_MS:               Number(env.UPSTREAM_TIMEOUT_MS        ?? UPSTREAM_TIMEOUT_MS),
-    MIN_CACHE_TTL_FLOOR:               Number(env.MIN_CACHE_TTL_FLOOR        ?? MIN_CACHE_TTL_FLOOR),
-    WORKER_CACHE_TTL_SECONDS:          Number(env.WORKER_CACHE_TTL_SECONDS   ?? WORKER_CACHE_TTL_SECONDS),
-    WORKER_BLOCKED_CACHE_TTL_SECONDS:  Number(env.WORKER_BLOCKED_CACHE_TTL_SECONDS ?? WORKER_BLOCKED_CACHE_TTL_SECONDS),
-    CLIENT_CACHE_TTL_SECONDS:          Number(env.CLIENT_CACHE_TTL_SECONDS   ?? CLIENT_CACHE_TTL_SECONDS),
-    CLIENT_BLOCKED_CACHE_TTL_SECONDS:  Number(env.CLIENT_BLOCKED_CACHE_TTL_SECONDS ?? CLIENT_BLOCKED_CACHE_TTL_SECONDS),
+    MIN_WAIT_MS:                       num(env.MIN_WAIT_MS, MIN_WAIT_MS),
+    UPSTREAM_TIMEOUT_MS:               num(env.UPSTREAM_TIMEOUT_MS, UPSTREAM_TIMEOUT_MS),
+    MIN_CACHE_TTL_FLOOR:               num(env.MIN_CACHE_TTL_FLOOR, MIN_CACHE_TTL_FLOOR),
+    WORKER_CACHE_TTL_SECONDS:          num(env.WORKER_CACHE_TTL_SECONDS, WORKER_CACHE_TTL_SECONDS),
+    WORKER_BLOCKED_CACHE_TTL_SECONDS:  num(env.WORKER_BLOCKED_CACHE_TTL_SECONDS, WORKER_BLOCKED_CACHE_TTL_SECONDS),
+    CLIENT_CACHE_TTL_SECONDS:          num(env.CLIENT_CACHE_TTL_SECONDS, CLIENT_CACHE_TTL_SECONDS),
+    CLIENT_BLOCKED_CACHE_TTL_SECONDS:  num(env.CLIENT_BLOCKED_CACHE_TTL_SECONDS, CLIENT_BLOCKED_CACHE_TTL_SECONDS),
     UPSTREAM_SERVERS:                  servers,
     UPSTREAM_COUNT:                    servers.length,
-    MAX_DNS_MESSAGE_SIZE:              Number(env.MAX_DNS_MESSAGE_SIZE       ?? MAX_DNS_MESSAGE_SIZE),
+    MAX_DNS_MESSAGE_SIZE:              num(env.MAX_DNS_MESSAGE_SIZE, MAX_DNS_MESSAGE_SIZE),
     DEBUG:                             env.DEBUG === "true" || DEBUG,
     PRIVACY_ECS_MODE:                  env.PRIVACY_ECS_MODE                  ?? PRIVACY_ECS_MODE,
     PRIVACY_ECS_SUBNET:                env.PRIVACY_ECS_SUBNET                ?? PRIVACY_ECS_SUBNET,
@@ -134,6 +148,6 @@ export function getConfig(env = {}) {
     PRIVACY_NSID_MODE:                 env.PRIVACY_NSID_MODE                 ?? PRIVACY_NSID_MODE,
     PRIVACY_NSID_VALUE:                env.PRIVACY_NSID_VALUE                ?? PRIVACY_NSID_VALUE,
     BLOCKING_MODE:                     env.BLOCKING_MODE                     ?? BLOCKING_MODE,
-    CACHE_RENEW_PERCENT:               Number(env.CACHE_RENEW_PERCENT         ?? CACHE_RENEW_PERCENT),
+    CACHE_RENEW_PERCENT:               num(env.CACHE_RENEW_PERCENT, CACHE_RENEW_PERCENT),
   };
 }

@@ -19,6 +19,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { toASCII } from "../../src/dns.js";
 import { buildCacheKey } from "../../src/cache.js";
 import { handleRequest } from "../../src/handler.js";
+
+// The X- diagnostic headers these tests read are emitted only under DEBUG;
+// production omits them to save bytes on metered links.
+const DEBUG_ENV = { DEBUG: "true" };
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsResponse } from "../../src/dns.js";
 
 // ---------------------------------------------------------------------------
@@ -29,13 +34,6 @@ function makeUrl(search) {
   return new URL(`https://worker.example.com/dns-query${search}`);
 }
 
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    match: (req) => Promise.resolve(store.get(typeof req === "string" ? req : req.url)),
-    put: (req, resp) => { store.set(typeof req === "string" ? req : req.url, resp); return Promise.resolve(); },
-  };
-}
 
 function makeUpstreamResponse(body, contentType = "application/dns-json") {
   return new Response(JSON.stringify(body), {
@@ -120,12 +118,12 @@ describe("RFC 4343 - Integration: case-insensitive cache lookup", () => {
   it("uppercase query result shares the same cache entry shape as lowercase", async () => {
     // First request: lowercase - populates cache
     const req1 = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    const r1 = await handleRequest(req1, {}, { waitUntil: () => {} });
+    const r1 = await handleRequest(req1, DEBUG_ENV, { waitUntil: () => {} });
     expect(r1.status).toBe(200);
 
     // Second request: UPPERCASE - should compute same cache key
     const req2 = new Request("https://worker.example.com/dns-query?name=EXAMPLE.COM&type=A");
-    const r2 = await handleRequest(req2, {}, { waitUntil: () => {} });
+    const r2 = await handleRequest(req2, DEBUG_ENV, { waitUntil: () => {} });
     expect(r2.status).toBe(200);
 
     // Both responses should carry X-Blocked: false
@@ -199,13 +197,13 @@ describe("Block detection - no usable IP leak in blocked response", () => {
 
   it("blocked A response carries X-Blocked: true", async () => {
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const resp = await handleRequest(req, {}, { waitUntil: () => {} });
+    const resp = await handleRequest(req, DEBUG_ENV, { waitUntil: () => {} });
     expect(resp.headers.get("x-blocked")).toBe("true");
   });
 
   it("blocked response body does not contain a routable IPv4 address", async () => {
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const resp = await handleRequest(req, {}, { waitUntil: () => {} });
+    const resp = await handleRequest(req, DEBUG_ENV, { waitUntil: () => {} });
     const body = await resp.json();
     // All Answer data values must be the block sentinel, not a routable IP
     if (body.Answer && body.Answer.length > 0) {
@@ -220,7 +218,7 @@ describe("Block detection - no usable IP leak in blocked response", () => {
 
   it("blocked response does not expose the sentinel IP in Status (must be 0 = NOERROR)", async () => {
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const resp = await handleRequest(req, {}, { waitUntil: () => {} });
+    const resp = await handleRequest(req, DEBUG_ENV, { waitUntil: () => {} });
     const body = await resp.json();
     // Status 0 = NOERROR - the block is signaled via X-Blocked header, not rcode
     expect(body.Status).toBe(0);
@@ -238,7 +236,7 @@ describe("Block detection - no usable IP leak in blocked response", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(makeUpstreamResponse(blockedAAAA));
 
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=AAAA");
-    const resp = await handleRequest(req, {}, { waitUntil: () => {} });
+    const resp = await handleRequest(req, DEBUG_ENV, { waitUntil: () => {} });
     expect(resp.headers.get("x-blocked")).toBe("true");
 
     const body = await resp.json();

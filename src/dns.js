@@ -23,6 +23,7 @@ export const HEX_TABLE = new Array(256);
 for (let i = 0; i < 256; i++) HEX_TABLE[i] = i.toString(16).padStart(2, "0");
 
 const TEXT_DECODER = new TextDecoder("utf-8");
+const TEXT_ENCODER = new TextEncoder();
 
 export const DNS_TYPE_TO_NUMBER = {
   A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28,
@@ -161,6 +162,53 @@ function encodeBase32Hex(bytes) {
 }
 
 // Advances past a DNS name at offset off and returns the new offset.
+/**
+ * Decode a base64url string into bytes (RFC 4648 Section 5), as used by the
+ * ?dns= parameter of RFC 8484 GET requests.
+ *
+ * Throws RangeError when the decoded length would exceed maxBytes -- checked
+ * before the output is allocated, so an oversized payload is rejected without
+ * reserving room for it. Invalid base64 throws whatever atob throws. Callers
+ * distinguish the two to answer 413 vs 400.
+ *
+ * @param {string} b64
+ * @param {number} [maxBytes=Infinity]
+ * @returns {Uint8Array}
+ */
+// Standard base64 of a byte range. The char-by-char loop is deliberate: it is
+// several times faster than String.fromCharCode(...bytes) and does not risk a
+// call-stack overflow on large records.
+function bytesToBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return btoa(out);
+}
+
+export function base64urlToBytes(b64, maxBytes = Infinity) {
+  const clean = b64.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(clean + "=".repeat((4 - clean.length % 4) % 4));
+  if (bin.length > maxBytes) throw new RangeError("base64url payload too large");
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Read the header flags a cache key must partition on: opcode, RD and CD.
+ * Returns null when the buffer is too short to contain them.
+ *
+ * @param {Uint8Array} buf
+ * @returns {{opcode: number, rd: boolean, cd: boolean}|null}
+ */
+export function extractHeaderFlags(buf) {
+  if (!buf || buf.length < 4) return null;
+  return {
+    opcode: (buf[2] >> 3) & 0x0f,
+    rd: !!(buf[2] & 0x01),
+    cd: !!(buf[3] & 0x10),
+  };
+}
+
 export function skipName(buf, off) {
   while (off < buf.length) {
     const len = buf[off];
@@ -217,12 +265,8 @@ function parseOpt(buf) {
   try {
     let off = 12;
     for (let q = 0; q < qdcount; q++) { off = skipName(buf, off); off += 4; }
-    for (let a = 0; a < ancount; a++) {
-      off = skipName(buf, off);
-      if (off + 10 > buf.length) return null;
-      off += 10 + ((buf[off + 8] << 8) | buf[off + 9]);
-    }
-    for (let n = 0; n < nscount; n++) {
+    // Answer and Authority are skipped identically; OPT is only ever in Additional.
+    for (let i = 0; i < ancount + nscount; i++) {
       off = skipName(buf, off);
       if (off + 10 > buf.length) return null;
       off += 10 + ((buf[off + 8] << 8) | buf[off + 9]);
@@ -234,6 +278,10 @@ function parseOpt(buf) {
       const rrtype   = (buf[off] << 8) | buf[off + 1];
       const rdlength = (buf[off + 8] << 8) | buf[off + 9];
       const rrEnd    = off + 10 + rdlength;
+      // A declared RDLENGTH past the end of the buffer makes rrStart/rrEnd
+      // unusable: replaceOpt/removeOpt size their output from that span and
+      // would under-allocate, throwing and failing the whole query.
+      if (rrEnd > buf.length) return null;
       if (rrtype === 41) {
         // off+6 = high byte of Z field; bit 7 = DO bit
         const doBit = !!(buf[off + 6] & 0x80);
@@ -242,6 +290,10 @@ function parseOpt(buf) {
         while (optOff + 4 <= rrEnd) {
           const code = (buf[optOff] << 8) | buf[optOff + 1];
           const len  = (buf[optOff + 2] << 8) | buf[optOff + 3];
+          // An option LENGTH must stay inside the OPT record. Slicing to the
+          // buffer end instead would pull in whole following records and copy
+          // them back out inside the option's data.
+          if (optOff + 4 + len > rrEnd) return null;
           options.push({ code, data: buf.slice(optOff + 4, optOff + 4 + len) });
           optOff += 4 + len;
         }
@@ -305,6 +357,69 @@ function removeOpt(buf, opt) {
   const newAr = ((buf[10] << 8) | buf[11]) - 1;
   out[10] = (newAr >> 8) & 0xff;
   out[11] = newAr & 0xff;
+  return out;
+}
+
+// Rebuilds a query containing only the records its header actually counts, with
+// every OPT record removed and ARCOUNT corrected.
+//
+// The privacy modes rebuild a single OPT, but a client controls its own header
+// counts, and two shapes slipped past that:
+//   - ARCOUNT=0 with an OPT present. The parser skips it, so appending a
+//     sanitised OPT sets ARCOUNT=1 and the upstream reads the CLIENT's OPT as
+//     the only one.
+//   - Several OPTs. Only the first was rewritten; the rest were forwarded
+//     verbatim (RFC 6891 Section 6.1.1 permits at most one).
+// Either way the client's ECS, cookie or NSID survives a mode that promises to
+// remove it. Rebuilding from the counted records drops both, and anything
+// trailing the last counted record with it.
+//
+// Falls back to header+question when the records cannot be walked: a message we
+// cannot parse is one we cannot sanitise, so nothing after the question is
+// forwarded. Returns null only when even the question is unreadable.
+function stripAllOpts(buf) {
+  if (buf.length < 12) return null;
+  const qdcount = (buf[4] << 8) | buf[5];
+  const ancount = (buf[6] << 8) | buf[7];
+  const nscount = (buf[8] << 8) | buf[9];
+  const arcount = (buf[10] << 8) | buf[11];
+
+  let off = 12;
+  for (let q = 0; q < qdcount; q++) {
+    off = skipName(buf, off);
+    off += 4;
+    if (off > buf.length) return null;
+  }
+  const questionEnd = off;
+
+  const kept = [];
+  let arKept = 0;
+  let walked = true;
+  for (let i = 0; i < ancount + nscount + arcount; i++) {
+    const start = off;
+    off = skipName(buf, off);
+    if (off + 10 > buf.length) { walked = false; break; }
+    const rrtype = (buf[off] << 8) | buf[off + 1];
+    const end = off + 10 + ((buf[off + 8] << 8) | buf[off + 9]);
+    if (end > buf.length) { walked = false; break; }
+    if (rrtype !== 41) {
+      kept.push({ start, end });
+      if (i >= ancount + nscount) arKept++;
+    }
+    off = end;
+  }
+  if (!walked) { kept.length = 0; arKept = 0; }
+
+  let len = questionEnd;
+  for (const k of kept) len += k.end - k.start;
+  const out = new Uint8Array(len);
+  out.set(buf.subarray(0, questionEnd));
+  let w = questionEnd;
+  for (const k of kept) { out.set(buf.subarray(k.start, k.end), w); w += k.end - k.start; }
+
+  if (!walked) { out[6] = 0; out[7] = 0; out[8] = 0; out[9] = 0; }
+  out[10] = (arKept >> 8) & 0xff;
+  out[11] = arKept & 0xff;
   return out;
 }
 
@@ -433,11 +548,12 @@ export function processEdnsOutgoing(buf, cfg, cookieBytes) {
     const nsidOpt = opt.options.find(o => o.code === 3);
     if (nsidOpt) newOptions.push(nsidOpt);
   }
-  // An OPT record with DO=1 is always emitted in outgoing queries.
-  if (opt) {
-    return replaceOpt(buf, opt, buildOptRecord(doBit, newOptions));
-  }
-  return appendOpt(buf, buildOptRecord(doBit, newOptions));
+  // An OPT record with DO=1 is always emitted in outgoing queries. Every OPT the
+  // client sent is removed first, so nothing it attached can reach the upstream
+  // regardless of what its header counts claimed.
+  const base = stripAllOpts(buf);
+  if (base === null) return buf; // question unreadable; upstream will reject it
+  return appendOpt(base, buildOptRecord(doBit, newOptions));
 }
 
 // ---------------------------------------------------------------------------
@@ -476,28 +592,26 @@ export function stripDnssecFromWire(buf, queryQtype) {
     const parts = [];
     let newAn = 0, newNs = 0;
 
-    for (let i = 0; i < ancount; i++) {
+    // A record we cannot fully parse makes every following offset meaningless:
+    // continuing would splice bytes out of the middle of a record and emit a
+    // message whose section counts disagree with its contents. Rebuilding is
+    // only safe when the whole Answer and Authority run parses cleanly, so any
+    // truncation returns the input untouched.
+    for (let i = 0; i < ancount + nscount; i++) {
+      const isAnswer = i < ancount;
       const start = off;
       off = skipName(buf, off);
-      if (off + 10 > buf.length) break;
+      if (off + 10 > buf.length) return buf;
       const rrtype = (buf[off] << 8) | buf[off + 1];
       const rdlen  = (buf[off + 8] << 8) | buf[off + 9];
       const end    = off + 10 + rdlen;
-      const keep   = !DNSSEC_AUTH_TYPES.has(rrtype) || rrtype === queryQtype;
-      if (keep) newAn++;
-      parts.push({ start, end, keep });
-      off = end;
-    }
-
-    for (let i = 0; i < nscount; i++) {
-      const start = off;
-      off = skipName(buf, off);
-      if (off + 10 > buf.length) break;
-      const rrtype = (buf[off] << 8) | buf[off + 1];
-      const rdlen  = (buf[off + 8] << 8) | buf[off + 9];
-      const end    = off + 10 + rdlen;
-      const keep   = !DNSSEC_AUTH_TYPES.has(rrtype); // authority: unconditionally strip
-      if (keep) newNs++;
+      if (end > buf.length) return buf; // rdlength runs past the buffer
+      // Answer keeps the type actually asked for (RFC 4035 S3.1.4.1);
+      // Authority strips unconditionally.
+      const keep = isAnswer
+        ? (!DNSSEC_AUTH_TYPES.has(rrtype) || rrtype === queryQtype)
+        : !DNSSEC_AUTH_TYPES.has(rrtype);
+      if (keep) { if (isAnswer) newAn++; else newNs++; }
       parts.push({ start, end, keep });
       off = end;
     }
@@ -647,6 +761,18 @@ export function hasDoBit(buf) {
  * @param {Uint8Array|null} buf
  * @returns {boolean}
  */
+/**
+ * True when the query carries an EDNS Client Subnet option (RFC 7871, code 8).
+ * Used to keep subnet-specific answers out of the shared edge cache.
+ *
+ * @param {Uint8Array} buf
+ * @returns {boolean}
+ */
+export function hasEcsOption(buf) {
+  const opt = parseOpt(buf);
+  return !!opt && opt.options.some(o => o.code === 8);
+}
+
 export function hasNsidRequest(buf) {
   if (!buf || buf.length < 12) return false;
   const opt = parseOpt(buf);
@@ -703,7 +829,14 @@ export function readDnsName(buf, off) {
       continue;
     }
     off += 1;
-    labels.push(TEXT_DECODER.decode(buf.subarray(off, off + len)));
+    // RFC 4343 Section 2.1: a label may legally contain a dot, so escape it in
+    // the presentation form. Joining raw labels with "." would map the single
+    // label "example.com" onto the same string as the two labels
+    // "example" + "com", while the upstream resolves the name the wire bytes
+    // actually encode -- letting a cache key built from this string collide
+    // with an unrelated query.
+    labels.push(TEXT_DECODER.decode(buf.subarray(off, off + len))
+      .replace(/\\/g, "\\\\").replace(/\./g, "\\."));
     off += len;
     if (!jumped) returnOffset = off;
   }
@@ -795,7 +928,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           const alg   = buf[off + 2];
           const dtype = buf[off + 3];
           let digest = "";
-          for (let i = 4; i < rdlength; i++) digest += HEX_TABLE[buf[off + i]];
+          for (let i = 4; i < rdlength && off + i < buf.length; i++) digest += HEX_TABLE[buf[off + i]];
           return `${tag} ${alg} ${dtype} ${digest}`;
         }
         break;
@@ -811,9 +944,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           const keyTag  = (buf[off+16] << 8) | buf[off+17];
           const signerR = readDnsName(buf, off + 18);
           const sigBytes = buf.subarray(signerR.offset, off + rdlength);
-          let sigB64 = "";
-          for (let i = 0; i < sigBytes.length; i++) sigB64 += String.fromCharCode(sigBytes[i]);
-          sigB64 = btoa(sigB64);
+          const sigB64 = bytesToBase64(sigBytes);
           const tcName = DNS_NUMBER_TO_TYPE[tc] || String(tc);
           return `${tcName} ${alg} ${labels} ${origTtl} ${sigExp} ${sigInc} ${keyTag} ${signerR.name} ${sigB64}`;
         }
@@ -830,9 +961,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           const proto =  buf[off + 2];
           const alg   =  buf[off + 3];
           const keyBytes = buf.subarray(off + 4, off + rdlength);
-          let keyB64 = "";
-          for (let i = 0; i < keyBytes.length; i++) keyB64 += String.fromCharCode(keyBytes[i]);
-          keyB64 = btoa(keyB64);
+          const keyB64 = bytesToBase64(keyBytes);
           return `${flags} ${proto} ${alg} ${keyB64}`;
         }
         break;
@@ -846,7 +975,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           let p = off + 5;
           const salt = saltLen === 0 ? "-" : (() => {
             let s = "";
-            for (let i = 0; i < saltLen; i++) s += HEX_TABLE[buf[p + i]];
+            for (let i = 0; i < saltLen && p + i < buf.length; i++) s += HEX_TABLE[buf[p + i]];
             return s;
           })();
           p += saltLen;
@@ -875,7 +1004,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
   } catch {}
   // Unknown or malformed: return hex
   let hex = "";
-  for (let i = 0; i < rdlength; i++) hex += HEX_TABLE[buf[off + i]];
+  for (let i = 0; i < rdlength && off + i < buf.length; i++) hex += HEX_TABLE[buf[off + i]];
   return hex;
 }
 
@@ -902,7 +1031,7 @@ export function wireToJson(buf) {
 
     let off = 12;
     const questions = [];
-    for (let q = 0; q < qdcount; q++) {
+    for (let q = 0; q < qdcount && off < buf.length; q++) {
       const { name, offset } = readDnsName(buf, off);
       off = offset;
       const qtype = (buf[off] << 8) | buf[off + 1];
@@ -1304,7 +1433,7 @@ export function hasDnssecDataJson(json) {
  * @returns {{ code: number, data: Uint8Array }}
  */
 export function buildEdeOption(infoCode, extraText = "") {
-  const textBytes = new TextEncoder().encode(extraText);
+  const textBytes = TEXT_ENCODER.encode(extraText);
   const data = new Uint8Array(2 + textBytes.length);
   data[0] = (infoCode >> 8) & 0xff;
   data[1] = infoCode & 0xff;
@@ -1359,9 +1488,13 @@ export function buildBlockedResponse(queryBuf, mode, opts = {}) {
   const qtype = queryInfo ? queryInfo.qtype : 1;
 
   // Extract question section from query for inclusion in response
-  const qdcount = (queryBuf[4] << 8) | queryBuf[5];
+  let qdcount = (queryBuf[4] << 8) | queryBuf[5];
   let qEnd = 12;
   for (let q = 0; q < qdcount; q++) { qEnd = skipName(queryBuf, qEnd); qEnd += 4; }
+  // subarray clamps silently, so a truncated question would be emitted with
+  // QDCOUNT still claiming a full one -- and the answer's 0xc00c owner-name
+  // pointer would then run off the end of the question into the answer itself.
+  if (qEnd > queryBuf.length) { qdcount = 0; qEnd = 12; }
   const questionSection = queryBuf.subarray(12, qEnd);
 
   let rcode = 0;
@@ -1381,6 +1514,9 @@ export function buildBlockedResponse(queryBuf, mode, opts = {}) {
     case "null":
     default:
       rcode = 0;
+      // The synthesised answer names itself with a 0xc00c pointer to the
+      // question, so without a question there is nothing valid to point at.
+      if (qdcount === 0) break;
       // Generate A=0.0.0.0 or AAAA=:: depending on query type
       if (qtype === 28) {
         // AAAA response: ::

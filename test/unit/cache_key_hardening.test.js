@@ -85,12 +85,16 @@ describe("cache key partitioning - wire query header flags", () => {
     expect(kIq.url).toContain("!o1r1c0");
   });
 
-  it("standard wire POST key has no flags suffix and still matches JSON GET key", () => {
+  it("standard wire POST key has no flags suffix; JSON differs only by format", () => {
     const q = buildDnsQuery("example.com", 1);
     const wireKey = buildCacheKey("aabbcc", POST_URL, q);
     const jsonKey = buildCacheKey("aabbcc", makeJsonUrl("?name=example.com&type=A"), null);
     expect(wireKey.url).not.toContain("!o");
-    expect(wireKey.url).toBe(jsonKey.url);
+    // Wire and JSON entries are keyed separately: a cache hit is replayed
+    // without format conversion, so a shared entry would hand a wire stub a
+    // JSON body. The name/type/flags portion is still identical, so the two
+    // formats stay in step apart from the format suffix.
+    expect(jsonKey.url).toBe(`${wireKey.url}!fjson`);
   });
 
   it("CD=1 wire GET produces a different cache key than CD=0 wire GET", () => {
@@ -102,12 +106,14 @@ describe("cache key partitioning - wire query header flags", () => {
     expect(kCd.url).not.toBe(kStd.url);
   });
 
-  it("wire CD=1 and JSON ?cd=1 share the same cache key", () => {
+  it("wire CD=1 and JSON ?cd=1 agree on the flags suffix", () => {
     const cd = buildDnsQuery("example.com", 1);
     cd[3] |= 0x10;
     const wireKey = buildCacheKey("aabbcc", POST_URL, cd);
     const jsonKey = buildCacheKey("aabbcc", makeJsonUrl("?name=example.com&type=A&cd=1"), null);
-    expect(wireKey.url).toBe(jsonKey.url);
+    // Both carry the CD flags variant; only the format suffix differs.
+    expect(wireKey.url).toContain("!o0r1c1");
+    expect(jsonKey.url).toBe(`${wireKey.url}!fjson`);
   });
 });
 

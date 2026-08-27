@@ -15,7 +15,6 @@ import {
   CLIENT_CACHE_TTL_SECONDS,
   CLIENT_BLOCKED_CACHE_TTL_SECONDS,
   UPSTREAM_SERVERS,
-  UPSTREAM_COUNT,
   MAX_DNS_MESSAGE_SIZE,
   PRIVACY_ECS_MODE,
   PRIVACY_ECS_SUBNET,
@@ -54,8 +53,9 @@ describe("Configuration constants", () => {
     expect(UPSTREAM_SERVERS.length).toBeGreaterThan(0);
   });
 
-  it("UPSTREAM_COUNT matches UPSTREAM_SERVERS length", () => {
-    expect(UPSTREAM_COUNT).toBe(UPSTREAM_SERVERS.length);
+  it("getConfig reports the upstream count", () => {
+    const cfg = getConfig({});
+    expect(cfg.UPSTREAM_COUNT).toBe(cfg.UPSTREAM_SERVERS.length);
   });
 
   it("all upstream URLs are valid HTTPS URLs", () => {

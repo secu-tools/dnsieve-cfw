@@ -9,24 +9,39 @@ import { describe, it, expect } from "vitest";
 import { getConfig, GENERAL_PROFILE_ID, UPSTREAM_SERVERS } from "../../src/config.js";
 
 describe("getConfig - invalid environment bindings", () => {
-  it("NaN UPSTREAM_TIMEOUT_MS falls back gracefully", () => {
+  // A NaN timeout aborts every fetch on the first tick, turning one typo in a
+  // dashboard variable into SERVFAIL for every query.
+  it("NaN UPSTREAM_TIMEOUT_MS falls back to the default", () => {
     const cfg = getConfig({ UPSTREAM_TIMEOUT_MS: "not-a-number" });
-    expect(Number.isNaN(cfg.UPSTREAM_TIMEOUT_MS)).toBe(true);
+    expect(cfg.UPSTREAM_TIMEOUT_MS).toBe(1500);
   });
 
-  it("NaN MIN_WAIT_MS produces NaN (no clamping)", () => {
+  it("NaN MIN_WAIT_MS falls back to the default", () => {
     const cfg = getConfig({ MIN_WAIT_MS: "abc" });
-    expect(Number.isNaN(cfg.MIN_WAIT_MS)).toBe(true);
+    expect(cfg.MIN_WAIT_MS).toBe(200);
   });
 
-  it("NaN MIN_CACHE_TTL_FLOOR produces NaN", () => {
+  it("NaN MIN_CACHE_TTL_FLOOR falls back to the default", () => {
     const cfg = getConfig({ MIN_CACHE_TTL_FLOOR: "xyz" });
-    expect(Number.isNaN(cfg.MIN_CACHE_TTL_FLOOR)).toBe(true);
+    expect(cfg.MIN_CACHE_TTL_FLOOR).toBe(600);
   });
 
-  it("NaN MAX_DNS_MESSAGE_SIZE produces NaN", () => {
+  // `x > NaN` is always false, so a NaN here disables both size gates.
+  it("NaN MAX_DNS_MESSAGE_SIZE falls back to the default", () => {
     const cfg = getConfig({ MAX_DNS_MESSAGE_SIZE: "large" });
-    expect(Number.isNaN(cfg.MAX_DNS_MESSAGE_SIZE)).toBe(true);
+    expect(cfg.MAX_DNS_MESSAGE_SIZE).toBe(65535);
+  });
+
+  it("no numeric config value is ever NaN", () => {
+    const cfg = getConfig({
+      MIN_WAIT_MS: "a", UPSTREAM_TIMEOUT_MS: "b", MIN_CACHE_TTL_FLOOR: "c",
+      WORKER_CACHE_TTL_SECONDS: "d", WORKER_BLOCKED_CACHE_TTL_SECONDS: "e",
+      CLIENT_CACHE_TTL_SECONDS: "f", CLIENT_BLOCKED_CACHE_TTL_SECONDS: "g",
+      MAX_DNS_MESSAGE_SIZE: "h", CACHE_RENEW_PERCENT: "i",
+    });
+    for (const [k, v] of Object.entries(cfg)) {
+      if (typeof v === "number") expect(Number.isFinite(v), `${k} is not finite`).toBe(true);
+    }
   });
 
   it("negative timeout value is accepted as-is", () => {

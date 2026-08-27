@@ -12,6 +12,7 @@ import {
   processEdnsIncoming,
   hasDnssecData,
   hasDnssecDataJson,
+  base64urlToBytes,
 } from "./dns.js";
 import { UPSTREAM_TIMEOUT_MS, DEBUG, PRIVACY_COOKIES_MODE } from "./config.js";
 
@@ -49,20 +50,22 @@ function updateServerCookie(upstreamUrl, serverBytes) {
   if (state) state.server = new Uint8Array(serverBytes);
 }
 
-// ---------------------------------------------------------------------------
-// Pre-parsed upstream URL cache
-// ---------------------------------------------------------------------------
-// Avoids re-parsing on every request in the hot path.
-const UPSTREAM_URL_CACHE = new Map();
+const DNS_HEADER_SIZE = 12;
 
-function getUpstreamUrlObj(resolvedUrl) {
-  let u = UPSTREAM_URL_CACHE.get(resolvedUrl);
-  if (!u) {
-    u = new URL(resolvedUrl);
-    if (UPSTREAM_URL_CACHE.size > 100) UPSTREAM_URL_CACHE.clear();
-    UPSTREAM_URL_CACHE.set(resolvedUrl, u);
+// Reads a response body, refusing anything larger than maxBytes.
+//
+// MAX_DNS_MESSAGE_SIZE guards client input; upstream bodies were unbounded, so
+// a broken or hostile upstream could have the isolate buffer an arbitrarily
+// large body -- and every copy made while parsing it -- against the 128 MB
+// isolate limit shared with other in-flight requests.
+async function readCapped(resp, maxBytes) {
+  const declared = Number(resp.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new RangeError("upstream response too large");
   }
-  return u;
+  const buf = await resp.arrayBuffer();
+  if (buf.byteLength > maxBytes) throw new RangeError("upstream response too large");
+  return buf;
 }
 
 export function buildUpstreamUrl(template, profileId) {
@@ -87,6 +90,8 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
   const timeout = cfg ? cfg.UPSTREAM_TIMEOUT_MS : UPSTREAM_TIMEOUT_MS;
   const debug   = cfg ? cfg.DEBUG               : DEBUG;
   const cookiesMode = cfg ? cfg.PRIVACY_COOKIES_MODE : PRIVACY_COOKIES_MODE;
+  const declaredMax = Number(cfg && cfg.MAX_DNS_MESSAGE_SIZE);
+  const maxMessage = Number.isFinite(declaredMax) && declaredMax > 0 ? declaredMax : 65535;
   if (debug) console.log(`[DoH] Upstream[${index}] -> ${upstreamUrl}  method=${method} clientWantsJson=${clientWantsJson}`);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeout);
@@ -107,8 +112,7 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
         signal: ac.signal,
       });
     } else if (isGetWire) {
-      const base = getUpstreamUrlObj(upstreamUrl);
-      const target = new URL(base.href);
+      const target = new URL(upstreamUrl);
       // Decode the base64url DNS query, apply EDNS processing (strip/modify OPT),
       // then re-encode before forwarding. Falls back to the original value on parse error.
       let dnsParam = stripBase64Padding(url.searchParams.get("dns") || "");
@@ -123,10 +127,7 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
               decoded[0] = 0; decoded[1] = 0;
             }
           } else {
-            const padded = dnsParam.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - dnsParam.length % 4) % 4);
-            const binStr = atob(padded);
-            decoded = new Uint8Array(binStr.length);
-            for (let i = 0; i < binStr.length; i++) decoded[i] = binStr.charCodeAt(i);
+            decoded = base64urlToBytes(dnsParam);
             // RFC 8484 SS.4.1: zero the DNS ID before upstream forwarding (same as POST path)
             if (decoded.length >= 2) { decoded[0] = 0; decoded[1] = 0; }
           }
@@ -144,14 +145,20 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       });
     } else {
       // JSON GET mode
-      const base = getUpstreamUrlObj(upstreamUrl);
-      const target = new URL(base.href);
-      for (const [k, v] of url.searchParams.entries()) {
-        if (ALLOWED_JSON_PARAMS.has(k)) target.searchParams.set(k, v);
-        // ECS forward mode: also pass edns_client_subnet if present in client request
-        if (k === "edns_client_subnet" && cfg && cfg.PRIVACY_ECS_MODE === "forward") {
-          target.searchParams.set(k, v);
-        }
+      const target = new URL(upstreamUrl);
+      // Iterate the allowlist and read each value with get(), which returns the
+      // FIRST occurrence -- the same one buildCacheKey uses. Iterating the
+      // client's params instead let a repeated key diverge the two: set() keeps
+      // the last value, so "?name=a&name=b" would query b upstream and cache the
+      // answer under a, letting any client bind an arbitrary answer to any name.
+      for (const k of ALLOWED_JSON_PARAMS) {
+        const v = url.searchParams.get(k);
+        if (v !== null) target.searchParams.set(k, v);
+      }
+      // ECS forward mode: also pass edns_client_subnet if present in client request
+      if (cfg && cfg.PRIVACY_ECS_MODE === "forward") {
+        const ecs = url.searchParams.get("edns_client_subnet");
+        if (ecs !== null) target.searchParams.set("edns_client_subnet", ecs);
       }
       // ECS substitute mode: inject the configured subnet as edns_client_subnet
       if (cfg && cfg.PRIVACY_ECS_MODE === "substitute" && cfg.PRIVACY_ECS_SUBNET) {
@@ -169,8 +176,8 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       });
     }
 
-    clearTimeout(timer);
     if (!resp.ok) {
+      clearTimeout(timer);
       if (debug) console.log(`[DoH] Upstream[${index}] HTTP error ${resp.status}`);
       return { index, ok: false };
     }
@@ -179,8 +186,17 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
     if (debug) console.log(`[DoH] Upstream[${index}] HTTP ${resp.status}  ct="${ct}"`);
 
     if (ct.includes("dns-message")) {
-      const rawFull = new Uint8Array(await resp.arrayBuffer());
-      if (rawFull.length >= 2) { rawFull[0] = 0; rawFull[1] = 0; } // Zero DNS ID (RFC 8484 SS.4.1)
+      // The timeout must stay armed across the body read: headers can arrive
+      // promptly and the body then stall forever, which would hang the fan-out.
+      const rawFull = new Uint8Array(await readCapped(resp, maxMessage));
+      clearTimeout(timer);
+      // A 200 with a body too short to be a DNS message is not a usable answer;
+      // without this it scores as ok and can win pickBestResult and be cached.
+      if (rawFull.length < DNS_HEADER_SIZE) {
+        if (debug) console.log(`[DoH] Upstream[${index}] response too short (${rawFull.length}B)`);
+        return { index, ok: false };
+      }
+      rawFull[0] = 0; rawFull[1] = 0; // Zero DNS ID (RFC 8484 SS.4.1)
       // Strip/filter EDNS OPT from upstream response: removes server cookies, upstream
       // NSID data, and other upstream-specific options before caching or returning.
       const raw = cfg
@@ -205,7 +221,8 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       return { index, ok: true, blocked, wire: true, raw, hasDnssec: hasDnssecData(raw) };
     }
 
-    const json = await resp.json();
+    const json = JSON.parse(new TextDecoder().decode(await readCapped(resp, maxMessage)));
+    clearTimeout(timer);
     if (debug) console.log(`[DoH] Upstream[${index}] json: Status=${json.Status} hasAnswer=${Array.isArray(json.Answer)} hasAuthority=${Array.isArray(json.Authority)} authorityLen=${Array.isArray(json.Authority) ? json.Authority.length : 0}`);
     if (isServerFailure(json)) return { index, ok: false };
     return { index, ok: true, blocked: isBlockedOrNxdomain(json), wire: false, json, hasDnssec: hasDnssecDataJson(json) };

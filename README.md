@@ -120,7 +120,7 @@ UPSTREAM_SERVERS = '["https://dns.quad9.net/dns-query","https://security.cloudfl
 
 | Variable | Default | Description |
 |---|---|---|
-| `MIN_CACHE_TTL_FLOOR` | `"60"` | Absolute minimum TTL (seconds) for both edge and client caches |
+| `MIN_CACHE_TTL_FLOOR` | `"600"` | Absolute minimum TTL (seconds) for both edge and client caches. Raising it trades slower pickup of record changes for fewer client re-queries |
 | `WORKER_CACHE_TTL_SECONDS` | `"1800"` | Edge cache TTL for normal responses |
 | `WORKER_BLOCKED_CACHE_TTL_SECONDS` | `"86400"` | Edge cache TTL for blocked / NXDOMAIN responses |
 | `CLIENT_CACHE_TTL_SECONDS` | `"1800"` | Client cache TTL for normal responses |

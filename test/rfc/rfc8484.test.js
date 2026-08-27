@@ -16,36 +16,10 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { handleRequest } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsQuery, buildDnsResponse } from "../../src/dns.js";
 
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      return store.get(typeof req === "string" ? req : req.url) || null;
-    },
-    async put(req, resp) {
-      store.set(typeof req === "string" ? req : req.url, resp.clone());
-    },
-  };
-}
 
-async function dispatch(request, fakeCache) {
-  const cache = fakeCache || makeFakeCache();
-  const env = {};
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-  const originalCaches = globalThis.caches;
-  globalThis.caches = { default: cache };
-  try {
-    const response = await handleRequest(request, env, ctx);
-    await Promise.allSettled(waitUntilTasks);
-    return { response, cache };
-  } finally {
-    globalThis.caches = originalCaches;
-  }
-}
 
 const wireOk = buildDnsResponse("example.com.", "93.184.216.34", 300);
 const jsonOk = {
@@ -118,7 +92,7 @@ describe("RFC 8484 SS.4.1 - DNS transaction ID handling", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    await dispatch(req, fakeCache);
+    await dispatch(req, { cache: fakeCache });
 
     const cachedEntries = [...fakeCache.store.values()];
     if (cachedEntries.length > 0) {

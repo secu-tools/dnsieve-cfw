@@ -21,6 +21,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { handleRequest } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsResponse, buildDnsQuery } from "../../src/dns.js";
 
 // ---------------------------------------------------------------------------
@@ -28,44 +29,10 @@ import { buildDnsResponse, buildDnsQuery } from "../../src/dns.js";
 // ---------------------------------------------------------------------------
 
 // A minimal fake Cloudflare Cache that stores responses by cache key URL.
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      const key = typeof req === "string" ? req : req.url;
-      return store.get(key) || null;
-    },
-    async put(req, resp) {
-      const key = typeof req === "string" ? req : req.url;
-      // Clone the response so the body is still readable later
-      store.set(key, resp.clone());
-    },
-  };
-}
 
 // Wraps handleRequest with injected fake caches.default and ctx.
-async function dispatch(request, fakeCache) {
-  return dispatchWithEnv(request, fakeCache, {});
-}
 
 // Like dispatch but accepts custom env bindings to override config.
-async function dispatchWithEnv(request, fakeCache, env) {
-  const cache = fakeCache || makeFakeCache();
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-
-  const originalCaches = globalThis.caches;
-  globalThis.caches = { default: cache };
-
-  try {
-    const response = await handleRequest(request, env || {}, ctx);
-    await Promise.allSettled(waitUntilTasks);
-    return { response, cache };
-  } finally {
-    globalThis.caches = originalCaches;
-  }
-}
 
 // Builds a fake upstream fetch implementation.
 // upstreams is an array of { contentType, body, status } indexed by call order or url match.
@@ -679,7 +646,7 @@ describe("Caching behaviour", () => {
     const fakeCache = makeFakeCache();
 
     const req1 = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatch(req1, fakeCache);
+    await dispatch(req1, { cache: fakeCache });
 
     // Reset fetch mock to count second-request calls
     const fetchMock = vi.fn(async () => new Response(JSON.stringify(jsonOkBody), {
@@ -688,7 +655,7 @@ describe("Caching behaviour", () => {
     globalThis.fetch = fetchMock;
 
     const req2 = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    const { response } = await dispatch(req2, fakeCache);
+    const { response } = await dispatch(req2, { cache: fakeCache });
 
     expect(response.status).toBe(200);
     // fetch should not have been called for the cache hit
@@ -706,7 +673,7 @@ describe("Caching behaviour", () => {
 
     // First request populates cache
     const req1 = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatch(req1, fakeCache);
+    await dispatch(req1, { cache: fakeCache });
 
     // Second request should be a cache hit
     const req2 = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
@@ -731,7 +698,7 @@ describe("Caching behaviour", () => {
 
     const fakeCache = makeFakeCache();
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    await dispatch(req, fakeCache);
+    await dispatch(req, { cache: fakeCache });
 
     const cachedEntries = [...fakeCache.store.values()];
     if (cachedEntries.length > 0) {
@@ -756,7 +723,7 @@ describe("Caching behaviour", () => {
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
     const req = new Request(`https://worker.example.com/dns-query?dns=${b64}`);
 
-    const first = await dispatch(req, fakeCache);
+    const first = await dispatch(req, { cache: fakeCache });
     const firstBuf = new Uint8Array(await first.response.arrayBuffer());
     expect(firstBuf[0]).toBe(0xbe);
     expect(firstBuf[1]).toBe(0xef);
@@ -774,7 +741,7 @@ describe("Caching behaviour", () => {
     });
     globalThis.fetch = fetchMock;
 
-    const second = await dispatch(req, fakeCache);
+    const second = await dispatch(req, { cache: fakeCache });
     const secondBuf = new Uint8Array(await second.response.arrayBuffer());
     expect(secondBuf[0]).toBe(0xbe);
     expect(secondBuf[1]).toBe(0xef);
@@ -1012,10 +979,10 @@ describe("Multiple profiles produce separate cache entries", () => {
     ]);
 
     const req1 = new Request("https://worker.example.com/p-aabbcc/dns-query?name=example.com&type=A");
-    await dispatch(req1, fakeCache);
+    await dispatch(req1, { cache: fakeCache });
 
     const req2 = new Request("https://worker.example.com/p-112233/dns-query?name=example.com&type=A");
-    await dispatch(req2, fakeCache);
+    await dispatch(req2, { cache: fakeCache });
 
     // Two distinct cache keys for two different profiles
     expect(fakeCache.store.size).toBeGreaterThanOrEqual(2);
@@ -1089,7 +1056,7 @@ describe("Blocking mode - wire POST", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "null" } });
     expect(response.headers.get("x-blocked")).toBe("true");
     expect(response.headers.get("x-blocking-mode")).toBe("null");
     const buf = new Uint8Array(await response.arrayBuffer());
@@ -1108,7 +1075,7 @@ describe("Blocking mode - wire POST", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "nxdomain" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "nxdomain" } });
     expect(response.headers.get("x-blocked")).toBe("true");
     const buf = new Uint8Array(await response.arrayBuffer());
     expect(buf[3] & 0x0f).toBe(3); // NXDOMAIN
@@ -1125,7 +1092,7 @@ describe("Blocking mode - wire POST", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "refused" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "refused" } });
     const buf = new Uint8Array(await response.arrayBuffer());
     expect(buf[3] & 0x0f).toBe(5); // REFUSED
   });
@@ -1141,7 +1108,7 @@ describe("Blocking mode - wire POST", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "nodata" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "nodata" } });
     const buf = new Uint8Array(await response.arrayBuffer());
     expect(buf[3] & 0x0f).toBe(0); // NOERROR
     expect((buf[6] << 8) | buf[7]).toBe(0); // ANCOUNT=0
@@ -1167,7 +1134,7 @@ describe("Blocking mode - EDE in wire POST (always auto-derived)", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "nxdomain" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "nxdomain" } });
     const buf = new Uint8Array(await response.arrayBuffer());
     // ARCOUNT=1 means OPT record (with EDE) was injected
     expect((buf[10] << 8) | buf[11]).toBe(1);
@@ -1184,10 +1151,10 @@ describe("Blocking mode - EDE in wire POST (always auto-derived)", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, {
+    const { response } = await dispatch(req, { cache: null, env: {
       BLOCKING_MODE: "nxdomain",
       UPSTREAM_SERVERS: '["https://dns.quad9.net/dns-query"]',
-    });
+    } });
     const buf = new Uint8Array(await response.arrayBuffer());
     expect((buf[10] << 8) | buf[11]).toBe(1); // OPT present
     const bufStr = String.fromCharCode(...buf);
@@ -1205,15 +1172,19 @@ describe("Blocking mode - EDE in wire POST (always auto-derived)", () => {
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, {
+    const { response } = await dispatch(req, { cache: null, env: {
       BLOCKING_MODE: "nxdomain",
       UPSTREAM_SERVERS: '["https://dns.quad9.net/dns-query"]',
-    });
+    } });
     const buf = new Uint8Array(await response.arrayBuffer());
     const bufStr = String.fromCharCode(...buf);
     // "Blocked (" prefix and closing ")" must both appear
     expect(bufStr).toContain("Blocked (");
-    expect(bufStr).toContain("dns-query)");
+    // Host only: the path is withheld so an upstream template such as
+    // https://dns.nextdns.io/{PROFILE_ID} cannot disclose the operator's
+    // profile id to every client that trips a block.
+    expect(bufStr).toContain("dns.quad9.net)");
+    expect(bufStr).not.toContain("dns-query");
   });
 
   it("EDE is present with all four blocking modes", async () => {
@@ -1228,7 +1199,7 @@ describe("Blocking mode - EDE in wire POST (always auto-derived)", () => {
         headers: { "Content-Type": "application/dns-message" },
         body: query,
       });
-      const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: mode });
+      const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: mode } });
       const buf = new Uint8Array(await response.arrayBuffer());
       expect((buf[10] << 8) | buf[11]).toBe(1);
     }
@@ -1251,7 +1222,7 @@ describe("Blocking mode - JSON GET", () => {
       { contentType: "application/dns-json", body: blockedJson },
     ]);
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "null" } });
     expect(response.headers.get("x-blocked")).toBe("true");
     const json = await response.json();
     expect(json.Status).toBe(0);
@@ -1264,7 +1235,7 @@ describe("Blocking mode - JSON GET", () => {
       { contentType: "application/dns-json", body: blockedJson },
     ]);
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "nxdomain" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "nxdomain" } });
     const json = await response.json();
     expect(json.Status).toBe(3);
     expect(json.Answer).toBeUndefined();
@@ -1276,7 +1247,7 @@ describe("Blocking mode - JSON GET", () => {
       { contentType: "application/dns-json", body: blockedJson },
     ]);
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    const { response } = await dispatchWithEnv(req, null, { BLOCKING_MODE: "nodata" });
+    const { response } = await dispatch(req, { cache: null, env: { BLOCKING_MODE: "nodata" } });
     expect(response.headers.get("x-blocking-mode")).toBe("nodata");
   });
 });
@@ -1314,9 +1285,9 @@ describe("DNSSEC preference - hardcoded (always prefers signed responses)", () =
       body: query,
     });
     // Use two upstreams: [0] unsigned (lower-priority), [1] signed (higher DNS priority = preferred)
-    const { response } = await dispatchWithEnv(req, null, {
+    const { response } = await dispatch(req, { cache: null, env: {
       UPSTREAM_SERVERS: '["https://upstream-a.example.com/dns-query","https://upstream-b.example.com/dns-query"]',
-    });
+    } });
 
     expect(response.status).toBe(200);
     // The signed upstream (index 1) must have been selected
@@ -1343,9 +1314,9 @@ describe("DNSSEC preference - hardcoded (always prefers signed responses)", () =
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, {
+    const { response } = await dispatch(req, { cache: null, env: {
       UPSTREAM_SERVERS: '["https://upstream-a.example.com/dns-query","https://upstream-b.example.com/dns-query"]',
-    });
+    } });
 
     expect(response.status).toBe(200);
     // No DNSSEC available, first (index 0) clean result is used
@@ -1370,9 +1341,9 @@ describe("DNSSEC preference - hardcoded (always prefers signed responses)", () =
       headers: { "Content-Type": "application/dns-message" },
       body: query,
     });
-    const { response } = await dispatchWithEnv(req, null, {
+    const { response } = await dispatch(req, { cache: null, env: {
       UPSTREAM_SERVERS: '["https://us-a.example.com/dns-query","https://us-b.example.com/dns-query","https://us-c.example.com/dns-query"]',
-    });
+    } });
 
     expect(response.status).toBe(200);
     expect(response.headers.get("x-upstream-index")).toBe("2");
@@ -1424,10 +1395,10 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
 
     // Pre-populate cache with a near-expired entry (1800s TTL, 1700s old => 100s < 10%*1800=180s)
     const staleBody = { ...jsonOkBody, Answer: [{ name: "example.com.", type: 1, TTL: 300, data: "1.2.3.4" }] };
-    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A!fjson";
     fakeCache.store.set(cacheKey, makeStaleResp(staleBody, "application/dns-json", 1800, 1700).clone());
 
-    const { response } = await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "10" });
+    const { response } = await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "10" } });
 
     // Response is served from cache (contains stale IP)
     expect(response.status).toBe(200);
@@ -1446,14 +1417,14 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     ]);
 
     const fakeCache = makeFakeCache();
-    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A!fjson";
     const staleBody = { ...jsonOkBody, Answer: [{ name: "example.com.", type: 1, TTL: 300, data: "1.2.3.4" }] };
     fakeCache.store.set(cacheKey, makeStaleResp(staleBody, "application/dns-json", 1800, 1700).clone());
 
-    // dispatchWithEnv awaits waitUntil tasks, so by the time it returns the
+    // dispatch awaits waitUntil tasks, so by the time it returns the
     // background refresh has written fresh data into the cache.
     const req = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "10" });
+    await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "10" } });
 
     // After background refresh settles, the cache should have the fresh IP.
     const updated = fakeCache.store.get(cacheKey);
@@ -1466,13 +1437,13 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     globalThis.fetch = vi.fn();
 
     const fakeCache = makeFakeCache();
-    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A!fjson";
     // Fresh entry: only 10s old, 1800s TTL => 1790s remaining >> 180s threshold
     const freshEntry = { ...jsonOkBody, Answer: [{ name: "example.com.", type: 1, TTL: 300, data: "1.2.3.4" }] };
     fakeCache.store.set(cacheKey, makeStaleResp(freshEntry, "application/dns-json", 1800, 10).clone());
 
     const req = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "10" });
+    await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "10" } });
 
     // fetch must not have been called because the entry is well above threshold
     expect(globalThis.fetch).not.toHaveBeenCalled();
@@ -1482,13 +1453,13 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     globalThis.fetch = vi.fn();
 
     const fakeCache = makeFakeCache();
-    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A!fjson";
     // Entry is near-expired but CACHE_RENEW_PERCENT=0 disables renewal
     const staleBody = { ...jsonOkBody };
     fakeCache.store.set(cacheKey, makeStaleResp(staleBody, "application/dns-json", 1800, 1700).clone());
 
     const req = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "0" });
+    await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "0" } });
 
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
@@ -1504,13 +1475,13 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     ]);
 
     const fakeCache = makeFakeCache();
-    const cacheKey = "https://doh-cache.internal/000000/json/blocked.example/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/blocked.example/A!fjson";
     // Old unblocked entry nearing expiry
     const oldBody = { ...jsonOkBody, Question: [{ name: "blocked.example.", type: 1 }] };
     fakeCache.store.set(cacheKey, makeStaleResp(oldBody, "application/dns-json", 1800, 1700).clone());
 
     const req = new Request("https://worker.example.com/dns-query?name=blocked.example&type=A");
-    await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "10" });
+    await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "10" } });
 
     const updated = fakeCache.store.get(cacheKey);
     expect(updated).not.toBeNull();
@@ -1523,7 +1494,7 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     globalThis.fetch = vi.fn();
 
     const fakeCache = makeFakeCache();
-    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A";
+    const cacheKey = "https://doh-cache.internal/000000/json/example.com/A!fjson";
     // Entry without X-Cache-Inserted-At / X-Worker-Cache-TTL (old format)
     fakeCache.store.set(cacheKey, new Response(JSON.stringify(jsonOkBody), {
       status: 200,
@@ -1535,7 +1506,7 @@ describe("Background cache refresh (stale-while-revalidate)", () => {
     }));
 
     const req = new Request("https://worker.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req, fakeCache, { CACHE_RENEW_PERCENT: "10" });
+    await dispatch(req, { cache: fakeCache, env: { CACHE_RENEW_PERCENT: "10" } });
 
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });

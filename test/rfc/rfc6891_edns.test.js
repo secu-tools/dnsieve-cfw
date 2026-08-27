@@ -28,6 +28,7 @@ import {
   processEdnsOutgoing,
   buildEcsOption,
   hasDoBit,
+  skipName,
 } from "../../src/dns.js";
 import { handleRequest } from "../../src/handler.js";
 
@@ -56,15 +57,6 @@ function optTypeIn(buf) {
   const types = [];
   let off = 12;
   try {
-    function skipName(b, o) {
-      while (o < b.length) {
-        const len = b[o];
-        if (len === 0) return o + 1;
-        if ((len & 0xc0) === 0xc0) return o + 2;
-        o += 1 + len;
-      }
-      return o;
-    }
     for (let i = 0; i < qdcount; i++) { off = skipName(buf, off); off += 4; }
     for (let i = 0; i < ancount + nscount; i++) {
       off = skipName(buf, off);
@@ -88,15 +80,6 @@ function getOptField(buf, fieldByteOffset) {
   const ancount = (buf[6] << 8) | buf[7];
   const nscount = (buf[8] << 8) | buf[9];
   let off = 12;
-  function skipName(b, o) {
-    while (o < b.length) {
-      const len = b[o];
-      if (len === 0) return o + 1;
-      if ((len & 0xc0) === 0xc0) return o + 2;
-      o += 1 + len;
-    }
-    return o;
-  }
   for (let i = 0; i < qdcount; i++) { off = skipName(buf, off); off += 4; }
   for (let i = 0; i < ancount + nscount; i++) {
     off = skipName(buf, off);
@@ -135,15 +118,6 @@ describe("RFC 6891 SS.6.1 - OPT RR wire format", () => {
     // Skip past header + question section
     let off = 12;
     const qdcount = (out[4] << 8) | out[5];
-    function skipName(b, o) {
-      while (o < b.length) {
-        const len = b[o];
-        if (len === 0) return o + 1;
-        if ((len & 0xc0) === 0xc0) return o + 2;
-        o += 1 + len;
-      }
-      return o;
-    }
     for (let i = 0; i < qdcount; i++) { off = skipName(out, off); off += 4; }
     // Now at first ARCOUNT entry (the OPT RR)
     expect(out[off]).toBe(0x00); // root name
@@ -254,15 +228,6 @@ describe("RFC 6891 - EDNS option forwarding", () => {
     const query = buildDnsQuery("example.com", 1);
     const cfg = makeConfig({ ecsMode: "substitute", ecsValue: "203.0.113.0/24" });
     const out = processEdnsOutgoing(query, cfg, null);
-    function skipName(b, o) {
-      while (o < b.length) {
-        const len = b[o];
-        if (len === 0) return o + 1;
-        if ((len & 0xc0) === 0xc0) return o + 2;
-        o += 1 + len;
-      }
-      return o;
-    }
     let off = 12;
     const qdcount = (out[4] << 8) | out[5];
     for (let i = 0; i < qdcount; i++) { off = skipName(out, off); off += 4; }
@@ -291,15 +256,6 @@ describe("RFC 6891 - EDNS option forwarding", () => {
     // Verify ECS option code 8 is absent
     let off = 12;
     const qdcount = (stripped[4] << 8) | stripped[5];
-    function skipName(b, o) {
-      while (o < b.length) {
-        const len = b[o];
-        if (len === 0) return o + 1;
-        if ((len & 0xc0) === 0xc0) return o + 2;
-        o += 1 + len;
-      }
-      return o;
-    }
     for (let i = 0; i < qdcount; i++) { off = skipName(stripped, off); off += 4; }
     off = skipName(stripped, off);
     const rdlen = (stripped[off + 8] << 8) | stripped[off + 9];

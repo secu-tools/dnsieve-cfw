@@ -11,6 +11,7 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleRequest } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import {
   buildDnsQuery,
   buildDnsResponse,
@@ -24,37 +25,8 @@ import {
 // Shared helpers (mirror worker.test.js pattern)
 // ---------------------------------------------------------------------------
 
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      return store.get(typeof req === "string" ? req : req.url) || null;
-    },
-    async put(req, resp) {
-      store.set(typeof req === "string" ? req : req.url, resp.clone());
-    },
-  };
-}
 
-async function dispatchWithEnv(request, env, fakeCache) {
-  const cache = fakeCache || makeFakeCache();
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-  const origCaches = globalThis.caches;
-  globalThis.caches = { default: cache };
-  try {
-    const response = await handleRequest(request, env || {}, ctx);
-    await Promise.allSettled(waitUntilTasks);
-    return { response, cache };
-  } finally {
-    globalThis.caches = origCaches;
-  }
-}
 
-async function dispatch(request, fakeCache) {
-  return dispatchWithEnv(request, {}, fakeCache);
-}
 
 // Encode a Uint8Array as base64url (no padding).
 function toBase64url(buf) {
@@ -139,7 +111,7 @@ describe("Wire GET blocked - null mode produces local 0.0.0.0 response", () => {
 
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
 
     expect(response.status).toBe(200);
     const buf = new Uint8Array(await response.arrayBuffer());
@@ -159,7 +131,7 @@ describe("Wire GET blocked - null mode produces local 0.0.0.0 response", () => {
 
     const query = buildDnsQuery("blocked.example.com", 28);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     const json = wireToJson(buf);
@@ -174,7 +146,7 @@ describe("Wire GET blocked - null mode produces local 0.0.0.0 response", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
     expect(response.headers.get("x-blocked")).toBe("true");
   });
 });
@@ -185,7 +157,7 @@ describe("Wire GET blocked - nxdomain mode", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "nxdomain" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "nxdomain" } });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     const json = wireToJson(buf);
@@ -200,7 +172,7 @@ describe("Wire GET blocked - nodata mode", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "nodata" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "nodata" } });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     const json = wireToJson(buf);
@@ -215,7 +187,7 @@ describe("Wire GET blocked - refused mode", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "refused" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "refused" } });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     const json = wireToJson(buf);
@@ -229,7 +201,7 @@ describe("Wire GET blocked - EDE is included in wire response", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     const arcount = (buf[10] << 8) | buf[11];
@@ -243,7 +215,7 @@ describe("Wire GET blocked - response uses content-type dns-message", () => {
     globalThis.fetch = makeBlockedWireFetch("blocked.example.com");
     const query = buildDnsQuery("blocked.example.com", 1);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
     expect(response.headers.get("content-type")).toContain("application/dns-message");
   });
 });
@@ -288,7 +260,7 @@ describe("RFC 4035 S.3.1.6 - CD flag propagation in JSON blocked responses", () 
       }), { headers: { "Content-Type": "application/dns-json" } })
     );
     const req = new Request("https://w.example.com/dns-query?name=blocked.example.com&type=A");
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
     const json = await response.json();
     expect(json.CD).toBe(false);
   });
@@ -302,7 +274,7 @@ describe("RFC 4035 S.3.1.6 - CD flag propagation in JSON blocked responses", () 
       }), { headers: { "Content-Type": "application/dns-json" } })
     );
     const req = new Request("https://w.example.com/dns-query?name=blocked.example.com&type=A&cd=1");
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "null" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "null" } });
     const json = await response.json();
     expect(json.CD).toBe(true);
   });
@@ -315,7 +287,7 @@ describe("RFC 4035 S.3.1.6 - CD flag propagation in JSON blocked responses", () 
       }), { headers: { "Content-Type": "application/dns-json" } })
     );
     const req = new Request("https://w.example.com/dns-query?name=blocked.example.com&type=A&cd=1");
-    const { response } = await dispatchWithEnv(req, { BLOCKING_MODE: "nxdomain" });
+    const { response } = await dispatch(req, { env: { BLOCKING_MODE: "nxdomain" } });
     const json = await response.json();
     expect(json.CD).toBe(true);
     expect(json.Status).toBe(3);

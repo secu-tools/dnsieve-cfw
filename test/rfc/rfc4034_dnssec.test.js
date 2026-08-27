@@ -28,6 +28,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { handleRequest } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import {
   buildDnsQuery,
   buildDnsQueryWithDo,
@@ -43,34 +44,7 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      return store.get(typeof req === "string" ? req : req.url) || null;
-    },
-    async put(req, resp) {
-      store.set(typeof req === "string" ? req : req.url, resp.clone());
-    },
-  };
-}
 
-async function dispatch(request, fakeCache) {
-  const cache = fakeCache || makeFakeCache();
-  const env = {};
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-  const originalCaches = globalThis.caches;
-  globalThis.caches = { default: cache };
-  try {
-    const response = await handleRequest(request, env, ctx);
-    await Promise.allSettled(waitUntilTasks);
-    return { response, cache };
-  } finally {
-    globalThis.caches = originalCaches;
-  }
-}
 
 // Build a minimal RRSIG record buffer (type 46, fixed-length signature).
 // Returns a wire-format DNS response with an A record and an RRSIG in Answer.
@@ -405,7 +379,7 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       headers: { "Content-Type": "application/dns-message" },
       body: queryDo,
     });
-    await dispatch(req, fakeCache);
+    await dispatch(req, { cache: fakeCache });
 
     // The cached response must retain the RRSIG (ANCOUNT=2)
     const entries = [...fakeCache.store.values()];
@@ -430,7 +404,7 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
       body: queryDo,
-    }), fakeCache);
+    }), { cache: fakeCache });
 
     // Second request: non-DO client, should hit cache and receive stripped response
     vi.restoreAllMocks();
@@ -440,7 +414,7 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       headers: { "Content-Type": "application/dns-message" },
       body: queryNoDo,
     });
-    const { response } = await dispatch(req2, fakeCache);
+    const { response } = await dispatch(req2, { cache: fakeCache });
     const buf = new Uint8Array(await response.arrayBuffer());
     const ancount = (buf[6] << 8) | buf[7];
     expect(ancount).toBe(1); // Only A record; RRSIG stripped for non-DO client
@@ -459,7 +433,7 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
       body: queryDo,
-    }), fakeCache);
+    }), { cache: fakeCache });
 
     // DO=1 client hits warm cache
     vi.restoreAllMocks();
@@ -468,7 +442,7 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       headers: { "Content-Type": "application/dns-message" },
       body: buildDnsQueryWithDo("example.com", 1, 0, true),
     });
-    const { response } = await dispatch(req2, fakeCache);
+    const { response } = await dispatch(req2, { cache: fakeCache });
     const buf = new Uint8Array(await response.arrayBuffer());
     const ancount = (buf[6] << 8) | buf[7];
     expect(ancount).toBe(2); // Full response for DO client
@@ -490,23 +464,20 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
       body: query,
-    }), fakeCache);
+    }), { cache: fakeCache });
 
     const prevFetchCount = fetchCount;
 
     // Wire GET for same query - should hit the cache populated by POST
     const b64 = btoa(String.fromCharCode(...query))
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-    await dispatch(
-      new Request(`https://w.example.com/dns-query?dns=${b64}`),
-      fakeCache
-    );
+    await dispatch(new Request(`https://w.example.com/dns-query?dns=${b64}`), { cache: fakeCache });
 
     // fetchCount should not have increased if cache was hit
     expect(fetchCount).toBe(prevFetchCount);
   });
 
-  it("JSON GET and wire POST same query share the same cache key", async () => {
+  it("JSON GET does not reuse a wire POST cache entry", async () => {
     const wireResp = buildDnsResponse("example.com.", "1.2.3.4", 300);
     let fetchCount = 0;
     globalThis.fetch = vi.fn(async () => {
@@ -522,17 +493,17 @@ describe("DNSSEC cache: full signed response cached; non-DO client gets stripped
       method: "POST",
       headers: { "Content-Type": "application/dns-message" },
       body: query,
-    }), fakeCache);
+    }), { cache: fakeCache });
 
     const prevFetchCount = fetchCount;
 
-    // JSON GET for same name/type should hit the same cache entry
-    await dispatch(
-      new Request("https://w.example.com/dns-query?name=example.com&type=A"),
-      fakeCache
-    );
+    // A JSON GET must NOT reuse the wire entry: the stored body is wire format
+    // and a hit is replayed without conversion, so the JSON client would
+    // receive raw DNS bytes. It fans out again into its own entry instead.
+    await dispatch(new Request("https://w.example.com/dns-query?name=example.com&type=A"), { cache: fakeCache });
 
-    expect(fetchCount).toBe(prevFetchCount);
+    expect(fetchCount).toBeGreaterThan(prevFetchCount);
+    expect(fakeCache.store.size).toBe(2);
   });
 });
 

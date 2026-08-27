@@ -44,7 +44,7 @@ describe("Cache key trailing-dot canonicalization", () => {
 // ---------------------------------------------------------------------------
 
 describe("Cache key unification across request formats", () => {
-  it("wire POST and JSON GET for same query produce same key", () => {
+  it("wire POST and JSON GET for same query are keyed separately by format", () => {
     const query = buildDnsQuery("example.com", 1);
     const urlPost = new URL("https://worker.example.com/dns-query");
     const keyPost = buildCacheKey("000000", urlPost, query);
@@ -52,10 +52,15 @@ describe("Cache key unification across request formats", () => {
     const urlJson = new URL("https://worker.example.com/dns-query?name=example.com&type=A");
     const keyJson = buildCacheKey("000000", urlJson, null);
 
-    expect(keyPost.url).toBe(keyJson.url);
+    // Wire and JSON entries are keyed separately: a cache hit is replayed
+    // without format conversion, so a shared entry would hand a wire stub a
+    // JSON body. The name/type/flags portion is still identical, so the two
+    // formats stay in step apart from the format suffix.
+    expect(keyPost.url).not.toBe(keyJson.url);
+    expect(keyJson.url).toBe(`${keyPost.url}!fjson`);
   });
 
-  it("wire GET and JSON GET for same query produce same key", () => {
+  it("wire GET and JSON GET for same query are keyed separately by format", () => {
     const query = buildDnsQuery("example.com", 1);
     // Encode as base64url
     let b64 = "";
@@ -68,7 +73,9 @@ describe("Cache key unification across request formats", () => {
     const urlJson = new URL("https://worker.example.com/dns-query?name=example.com&type=A");
     const keyJson = buildCacheKey("000000", urlJson, null);
 
-    expect(keyWire.url).toBe(keyJson.url);
+    // Wire and JSON are keyed separately: a hit is replayed without format
+    // conversion, so a shared entry would hand a wire stub a JSON body.
+    expect(keyJson.url).toBe(`${keyWire.url}!fjson`);
   });
 });
 

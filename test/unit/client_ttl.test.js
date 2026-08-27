@@ -20,7 +20,7 @@ import {
   buildDnsQueryWithDo,
   hasDoBit,
 } from "../../src/dns.js";
-import { remainingClientTtl } from "../../src/handler.js";
+import { remainingClientTtl } from "../../src/cache.js";
 
 const CFG = { MIN_CACHE_TTL_FLOOR: 60 };
 const nowSec = () => Math.floor(Date.now() / 1000);

@@ -238,13 +238,14 @@ describe("computeClientTtl", () => {
 
   it("still caps a NON-blocked result at the upstream record TTL", () => {
     const result = { wire: false, json: { Status: 0, Answer: [{ TTL: 120, data: "1.2.3.4" }] } };
-    expect(computeClientTtl(result, false)).toBe(120);
+    // Record TTL 120 is below the 600s floor, so the floor wins.
+    expect(computeClientTtl(result, false)).toBe(600);
   });
 
   it("applies MIN_CACHE_TTL_FLOOR for very small wire TTL values", () => {
     const raw = buildDnsResponse("short.example.", "1.2.3.4", 1);
     const result = { wire: true, raw };
-    expect(computeClientTtl(result, false)).toBe(60);
+    expect(computeClientTtl(result, false)).toBe(600);
   });
 });
 
@@ -355,7 +356,7 @@ describe("computeClientTtl - additional coverage", () => {
       },
     };
     const ttl = computeClientTtl(result, false);
-    expect(ttl).toBe(120);
+    expect(ttl).toBe(600);
   });
 
   it("applies floor to 0-TTL DNS record", () => {
@@ -391,14 +392,16 @@ describe("buildCacheKey - unified key format (wire = json)", () => {
     expect(key.url).toContain("example.com");
   });
 
-  it("valid wire GET and JSON GET for same domain produce identical cache keys", () => {
+  it("wire GET and JSON GET for same domain differ only by the format suffix", () => {
     const q = buildDnsQuery("example.com", 1);
     const b64 = btoa(String.fromCharCode(...q))
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
     const wireGetKey = buildCacheKey("aabbcc",
       new URL(`https://w.example.com/dns-query?dns=${b64}`), null);
     const jsonGetKey = buildCacheKey("aabbcc", makeJsonUrl("example.com", "A"), null);
-    expect(wireGetKey.url).toBe(jsonGetKey.url);
+    // Wire and JSON are keyed separately: a hit is replayed without format
+    // conversion, so a shared entry would hand a wire stub a JSON body.
+    expect(jsonGetKey.url).toBe(`${wireGetKey.url}!fjson`);
   });
 
   it("wire POST for valid DNS query produces /json/ cache key", () => {
@@ -413,12 +416,14 @@ describe("buildCacheKey - unified key format (wire = json)", () => {
     }
   });
 
-  it("wire POST and JSON GET for same domain produce identical cache keys", () => {
+  it("wire POST and JSON GET for same domain differ only by the format suffix", () => {
     const q = buildDnsQuery("example.com", 1);
     const wirePostKey = buildCacheKey("aabbcc",
       new URL("https://w.example.com/dns-query"), q);
     const jsonGetKey = buildCacheKey("aabbcc", makeJsonUrl("example.com", "A"), null);
-    expect(wirePostKey.url).toBe(jsonGetKey.url);
+    // Wire and JSON are keyed separately: a hit is replayed without format
+    // conversion, so a shared entry would hand a wire stub a JSON body.
+    expect(jsonGetKey.url).toBe(`${wirePostKey.url}!fjson`);
   });
 
   it("DO=0 wire POST and DO=1 wire POST share the same cache key", () => {

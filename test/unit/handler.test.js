@@ -217,10 +217,9 @@ describe("computeClientTtl", () => {
   });
 
   it("works for wire results", () => {
-    const raw = buildDnsResponse("example.com.", "1.2.3.4", 60);
-    const result = { wire: true, raw };
-    const ttl = computeClientTtl(result, false);
-    expect(ttl).toBe(60);
+    // A record TTL above the floor is used as-is; one below it is raised.
+    expect(computeClientTtl({ wire: true, raw: buildDnsResponse("example.com.", "1.2.3.4", 900) }, false)).toBe(900);
+    expect(computeClientTtl({ wire: true, raw: buildDnsResponse("example.com.", "1.2.3.4", 60) }, false)).toBe(600);
   });
 });
 

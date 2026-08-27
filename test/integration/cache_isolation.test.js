@@ -12,35 +12,10 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { handleRequest } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsQuery, buildDnsQueryWithDo, buildDnsResponse } from "../../src/dns.js";
 
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      return store.get(typeof req === "string" ? req : req.url) || null;
-    },
-    async put(req, resp) {
-      store.set(typeof req === "string" ? req : req.url, resp.clone());
-    },
-  };
-}
 
-async function dispatchWithEnv(request, env, fakeCache) {
-  const cache = fakeCache || makeFakeCache();
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-  const origCaches = globalThis.caches;
-  globalThis.caches = { default: cache };
-  try {
-    const response = await handleRequest(request, env || {}, ctx);
-    await Promise.allSettled(waitUntilTasks);
-    return { response, cache };
-  } finally {
-    globalThis.caches = origCaches;
-  }
-}
 
 function toBase64url(buf) {
   let b = "";
@@ -89,7 +64,7 @@ describe("Wire GET - DNS transaction ID is zeroed in cached responses", () => {
 
     const query = buildDnsQuery("blocked.example.com", 1, 0x1234);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    const { response, cache } = await dispatchWithEnv(req, { MIN_WAIT_MS: "10" });
+    const { response, cache } = await dispatch(req, { env: { MIN_WAIT_MS: "10" } });
 
     // Direct reply carries the client's original transaction ID
     const replyBuf = new Uint8Array(await response.arrayBuffer());
@@ -111,14 +86,14 @@ describe("Wire GET - DNS transaction ID is zeroed in cached responses", () => {
     // Client 1: non-zero transaction ID, populates the cache
     const q1 = buildDnsQuery("blocked.example.com", 1, 0x1234);
     const req1 = new Request(`https://w.example.com/dns-query?dns=${toBase64url(q1)}`);
-    await dispatchWithEnv(req1, { MIN_WAIT_MS: "10" }, cache);
+    await dispatch(req1, { env: { MIN_WAIT_MS: "10" }, cache: cache });
     expect(cache.store.size).toBe(1);
 
     // Client 2: ID=0 with DO=1 - the cache hit fast path returns the cached
     // bytes unmodified, so any leaked ID would surface here.
     const q2 = buildDnsQueryWithDo("blocked.example.com", 1, 0, true);
     const req2 = new Request(`https://w.example.com/dns-query?dns=${toBase64url(q2)}`);
-    const { response } = await dispatchWithEnv(req2, { MIN_WAIT_MS: "10" }, cache);
+    const { response } = await dispatch(req2, { env: { MIN_WAIT_MS: "10" }, cache: cache });
 
     const buf = new Uint8Array(await response.arrayBuffer());
     expect(buf[0]).toBe(0);
@@ -131,7 +106,7 @@ describe("Wire GET - DNS transaction ID is zeroed in cached responses", () => {
 
     const query = buildDnsQuery("blocked.example.com", 1, 0xbeef);
     const req = new Request(`https://w.example.com/dns-query?dns=${toBase64url(query)}`);
-    await dispatchWithEnv(req, { MIN_WAIT_MS: "10" });
+    await dispatch(req, { env: { MIN_WAIT_MS: "10" } });
 
     expect(fetchMock).toHaveBeenCalled();
     for (const call of fetchMock.mock.calls) {
@@ -170,14 +145,14 @@ describe("JSON GET - ?cd=1 responses are cached separately from cd=0", () => {
 
     // Request 1: cd=1 (upstream validation disabled)
     const req1 = new Request("https://w.example.com/dns-query?name=example.com&type=A&cd=1");
-    await dispatchWithEnv(req1, {}, cache);
+    await dispatch(req1, { env: {}, cache: cache });
     const callsAfterFirst = fetchMock.mock.calls.length;
     expect(callsAfterFirst).toBeGreaterThan(0);
     expect(cache.store.size).toBe(1);
 
     // Request 2: same name/type without cd - must MISS and query upstream again
     const req2 = new Request("https://w.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req2, {}, cache);
+    await dispatch(req2, { env: {}, cache: cache });
     expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
     expect(cache.store.size).toBe(2);
   });
@@ -188,11 +163,11 @@ describe("JSON GET - ?cd=1 responses are cached separately from cd=0", () => {
     const cache = makeFakeCache();
 
     const req1 = new Request("https://w.example.com/dns-query?name=example.com&type=A");
-    await dispatchWithEnv(req1, {}, cache);
+    await dispatch(req1, { env: {}, cache: cache });
     const callsAfterFirst = fetchMock.mock.calls.length;
 
     const req2 = new Request("https://w.example.com/dns-query?name=example.com&type=A");
-    const { response } = await dispatchWithEnv(req2, {}, cache);
+    const { response } = await dispatch(req2, { env: {}, cache: cache });
 
     expect(fetchMock.mock.calls.length).toBe(callsAfterFirst); // served from cache
     expect(cache.store.size).toBe(1);

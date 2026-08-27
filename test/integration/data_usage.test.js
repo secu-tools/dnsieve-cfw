@@ -12,41 +12,9 @@
 //     refresh rather than one per request
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { handleRequest, INFLIGHT_REFRESH } from "../../src/handler.js";
+import { INFLIGHT_REFRESH } from "../../src/handler.js";
+import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsQuery, buildDnsResponse, extractMinTtlWire } from "../../src/dns.js";
-
-function makeFakeCache() {
-  const store = new Map();
-  return {
-    store,
-    async match(req) {
-      const key = typeof req === "string" ? req : req.url;
-      return store.get(key) ? store.get(key).clone() : null;
-    },
-    async put(req, resp) {
-      const key = typeof req === "string" ? req : req.url;
-      store.set(key, resp.clone());
-    },
-  };
-}
-
-// Dispatches a request against the worker with a fake cache and ctx.
-// waitUntil tasks are collected so tests can await background work explicitly.
-async function dispatch(request, { cache, env = {}, awaitBackground = true } = {}) {
-  const theCache = cache || makeFakeCache();
-  const waitUntilTasks = [];
-  const ctx = { waitUntil: (p) => waitUntilTasks.push(p) };
-
-  const originalCaches = globalThis.caches;
-  globalThis.caches = { default: theCache };
-  try {
-    const response = await handleRequest(request, env, ctx);
-    if (awaitBackground) await Promise.allSettled(waitUntilTasks);
-    return { response, cache: theCache, waitUntilTasks };
-  } finally {
-    globalThis.caches = originalCaches;
-  }
-}
 
 function wirePost(name, { qtype = 1, id = 0 } = {}) {
   return new Request("https://worker.example.com/dns-query", {
@@ -364,5 +332,48 @@ describe("edge-cache bookkeeping never reaches the client", () => {
     const hit = await dispatch(wirePost("priv.example.com"), { cache, env });
 
     expect(hit.response.headers.get("Cache-Control")).not.toContain("1800");
+  });
+});
+
+describe("blocked verdicts reach the edge cache", () => {
+  // A resolver block is among the fastest answers an upstream produces, so
+  // nearly every block takes the early-return path. If that path skipped the
+  // cache write, WORKER_BLOCKED_CACHE_TTL_SECONDS would never apply and every
+  // repeat query for a blocked domain would re-run the full fan-out.
+  it("caches a block once every upstream has answered", async () => {
+    globalThis.fetch = wireUpstreams(buildDnsResponse("ads.example.com", "0.0.0.0", 60));
+    const cache = makeFakeCache();
+    const env = { UPSTREAM_SERVERS: TWO_UPSTREAMS, BLOCKING_MODE: "null" };
+
+    const { response } = await dispatch(wirePost("ads.example.com"), { cache, env });
+    expect(response.headers.get("X-Blocked")).toBe("true");
+    expect(cache.store.size).toBe(1);
+
+    // The second request must be served from cache without any fan-out.
+    const before = globalThis.fetch.mock.calls.length;
+    const second = await dispatch(wirePost("ads.example.com"), { cache, env });
+    expect(globalThis.fetch.mock.calls.length).toBe(before);
+    expect(second.response.headers.get("X-Blocked")).toBe("true");
+  });
+
+  it("does not cache when an upstream failed to answer", async () => {
+    // Preserves the phase-2 rule: only cache when every upstream responded.
+    let call = 0;
+    globalThis.fetch = vi.fn(async () => {
+      if (call++ === 0) {
+        return new Response(buildDnsResponse("ads.example.com", "0.0.0.0", 60), {
+          status: 200, headers: { "Content-Type": "application/dns-message" },
+        });
+      }
+      throw new Error("upstream down");
+    });
+    const cache = makeFakeCache();
+
+    const { response } = await dispatch(wirePost("ads.example.com"), {
+      cache, env: { UPSTREAM_SERVERS: TWO_UPSTREAMS, BLOCKING_MODE: "null" },
+    });
+
+    expect(response.headers.get("X-Blocked")).toBe("true");
+    expect(cache.store.size).toBe(0);
   });
 });
