@@ -20,9 +20,12 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260714.1",
-    "@vitest/coverage-v8": "^4.1.10",
-    "vitest": "^4.1.10",
-    "wrangler": "^4.110.0"
+    "@cloudflare/workers-types": "^5.20260918.1",
+    "@vitest/coverage-istanbul": "^4.1.11",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.135.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
   }
 }

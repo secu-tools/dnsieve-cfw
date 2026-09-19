@@ -18,5 +18,11 @@ export default defineConfig({
     include: ["test/**/*.test.js"],
     // Increase timeout for integration tests that use fake timers or multiple awaits
     testTimeout: 15000,
+    coverage: {
+      // V8 native coverage relies on node:inspector, which workerd does not
+      // implement, so instrument the sources with Istanbul instead.
+      provider: "istanbul",
+      include: ["src/**/*.js"],
+    },
   },
 });
