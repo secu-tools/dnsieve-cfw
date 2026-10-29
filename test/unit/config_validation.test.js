@@ -59,9 +59,11 @@ describe("getConfig - invalid environment bindings", () => {
     expect(cfg.WORKER_CACHE_TTL_SECONDS).toBe(999999999);
   });
 
-  it("empty string numeric field becomes 0", () => {
-    const cfg = getConfig({ UPSTREAM_TIMEOUT_MS: "" });
-    expect(cfg.UPSTREAM_TIMEOUT_MS).toBe(0);
+  it("empty or blank numeric field falls back to the default", () => {
+    // Number("") is 0: a cleared dashboard field would otherwise become a 0 ms
+    // upstream timeout and turn every query into SERVFAIL.
+    expect(getConfig({ UPSTREAM_TIMEOUT_MS: "" }).UPSTREAM_TIMEOUT_MS).toBe(1500);
+    expect(getConfig({ MAX_DNS_MESSAGE_SIZE: "  " }).MAX_DNS_MESSAGE_SIZE).toBe(65535);
   });
 
   it("float string is accepted as float", () => {

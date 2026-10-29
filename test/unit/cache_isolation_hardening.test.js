@@ -35,8 +35,9 @@ describe("lossy Unicode folding cannot collapse distinct names onto one key", ()
     expect(keyFor(mutated)).not.toBe(keyFor("example.com"));
   });
 
-  it("still folds a genuine IDN to punycode so formats share one entry", () => {
-    // This is what the normalisation exists for and must keep working.
+  it("still folds a genuine IDN to punycode", () => {
+    // This is what the normalisation exists for and must keep working. It is
+    // safe because the upstream is sent the same punycode name (see below).
     expect(keyFor("m\u00FCnchen.de")).toContain("xn--");
     expect(keyFor("m\u00FCnchen.de")).toBe(keyFor("xn--mnchen-3ya.de"));
   });
@@ -44,6 +45,11 @@ describe("lossy Unicode folding cannot collapse distinct names onto one key", ()
   it("leaves plain ASCII names alone", () => {
     expect(keyFor("example.com")).toContain("example.com");
     expect(keyFor("EXAMPLE.COM")).toBe(keyFor("example.com"));
+  });
+
+  it("U+212A KELVIN SIGN does not share the key of the ASCII letter k", () => {
+    // String.toLowerCase maps U+212A to "k"; DNS folds ASCII case only.
+    expect(keyFor("faceboo\u212A.com")).not.toBe(keyFor("facebook.com"));
   });
 
   it("a mutated name does not answer for the real one end to end", async () => {
@@ -65,6 +71,32 @@ describe("lossy Unicode folding cannot collapse distinct names onto one key", ()
     const body = await response.json();
     expect(body.Answer[0].data).toBe("1.1.1.1");
     expect(asked).toContain("example.com");
+  });
+});
+
+describe("the upstream is asked exactly what the JSON key records", () => {
+  const jsonUpstream = (body) => vi.fn(async () => new Response(JSON.stringify(body),
+    { headers: { "Content-Type": "application/dns-json" } }));
+
+  it("forwards the canonical name, type and cd rather than the client's spelling", async () => {
+    globalThis.fetch = jsonUpstream({ Status: 0, Answer: [] });
+    // "M" + U+00DC + "nchen.DE." with a lower-case type and a spelled-out cd.
+    await dispatch(jsonGet("name=M%C3%9Cnchen.DE.&type=aaaa&cd=true"), { env: { UPSTREAM_SERVERS: ONE } });
+
+    const p = new URL(globalThis.fetch.mock.calls[0][0].toString()).searchParams;
+    expect([p.get("name"), p.get("type"), p.get("cd")]).toEqual(["xn--mnchen-3ya.de", "AAAA", "1"]);
+  });
+
+  it("?cd=true is mirrored into a synthesised response like ?cd=1", async () => {
+    globalThis.fetch = jsonUpstream({
+      Status: 0, Question: [{ name: "ads.example.", type: 1 }],
+      Answer: [{ name: "ads.example.", type: 1, TTL: 60, data: "0.0.0.0" }],
+    });
+    const { response } = await dispatch(jsonGet("name=ads.example&type=A&cd=true"),
+      { env: { UPSTREAM_SERVERS: ONE } });
+
+    expect(response.headers.get("X-Blocked")).toBe("true");
+    expect((await response.json()).CD).toBe(true);
   });
 });
 

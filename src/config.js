@@ -115,8 +115,11 @@ export const CACHE_RENEW_PERCENT = 10;
 // A NaN reaching a consumer is silently destructive: NaN as UPSTREAM_TIMEOUT_MS
 // aborts every fetch on the first tick (SERVFAIL for every query), and NaN as
 // MAX_DNS_MESSAGE_SIZE disables both size gates, since any `x > NaN` is false.
+// A blank value counts as unset: Number("") is 0, so clearing a dashboard field
+// would otherwise set a 0 ms timeout -- the same SERVFAIL-for-everything case.
 function num(value, fallback) {
-  const n = Number(value ?? fallback);
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 

@@ -13,13 +13,10 @@ import {
   hasDnssecData,
   hasDnssecDataJson,
   base64urlToBytes,
+  bytesToBase64url,
 } from "./dns.js";
+import { jsonQuery } from "./cache.js";
 import { UPSTREAM_TIMEOUT_MS, DEBUG, PRIVACY_COOKIES_MODE } from "./config.js";
-
-// Only these query parameters are forwarded to upstream DoH servers in JSON mode.
-// Forwarding arbitrary client params (e.g. edns_client_subnet) would leak client
-// identity information to the upstream resolver.
-const ALLOWED_JSON_PARAMS = new Set(["name", "type", "ct", "do", "cd"]);
 
 // ---------------------------------------------------------------------------
 // Per-upstream cookie state (RFC 7873 reoriginate mode)
@@ -29,11 +26,18 @@ const ALLOWED_JSON_PARAMS = new Set(["name", "type", "ct", "do", "cd"]);
 // Exported so tests can inspect and reset it between cases.
 export const COOKIE_STORE = new Map();
 
+// Upper bound on COOKIE_STORE. Keys are resolved upstream URLs, so a template
+// containing {PROFILE_ID} yields one entry per profile a client names -- and
+// any client can name millions. Past the cap the oldest entry is evicted; its
+// upstream then sees a fresh client cookie, exactly as after a cold start.
+const COOKIE_STORE_MAX = 1024;
+
 function getCookieBytes(upstreamUrl) {
   if (!COOKIE_STORE.has(upstreamUrl)) {
+    if (COOKIE_STORE.size >= COOKIE_STORE_MAX) COOKIE_STORE.delete(COOKIE_STORE.keys().next().value);
     const client = new Uint8Array(8);
     crypto.getRandomValues(client);
-    COOKIE_STORE.set(upstreamUrl, { client: client.slice(), server: null });
+    COOKIE_STORE.set(upstreamUrl, { client, server: null });
   }
   const { client, server } = COOKIE_STORE.get(upstreamUrl);
   if (server) {
@@ -52,20 +56,45 @@ function updateServerCookie(upstreamUrl, serverBytes) {
 
 const DNS_HEADER_SIZE = 12;
 
+// A JSON answer spells out every owner name in full and renders RDATA as text,
+// so it runs several times the size of the same answer on the wire (where a
+// repeated name is a 2-byte pointer). Capping JSON bodies at the wire limit
+// would turn a large but legitimate answer into SERVFAIL.
+const JSON_SIZE_FACTOR = 16;
+
 // Reads a response body, refusing anything larger than maxBytes.
 //
 // MAX_DNS_MESSAGE_SIZE guards client input; upstream bodies were unbounded, so
 // a broken or hostile upstream could have the isolate buffer an arbitrarily
 // large body -- and every copy made while parsing it -- against the 128 MB
-// isolate limit shared with other in-flight requests.
+// isolate limit shared with other in-flight requests. The body is streamed and
+// the read abandoned as soon as it passes the cap, so a body without a
+// Content-Length (chunked) is bounded too, not only one that declares its size.
 async function readCapped(resp, maxBytes) {
   const declared = Number(resp.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new RangeError("upstream response too large");
   }
-  const buf = await resp.arrayBuffer();
-  if (buf.byteLength > maxBytes) throw new RangeError("upstream response too large");
-  return buf;
+  const chunks = [];
+  let total = 0;
+  if (resp.body) {
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        reader.cancel().catch(() => {});
+        throw new RangeError("upstream response too large");
+      }
+      chunks.push(value);
+    }
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let w = 0;
+  for (const c of chunks) { out.set(c, w); w += c.byteLength; }
+  return out;
 }
 
 export function buildUpstreamUrl(template, profileId) {
@@ -131,10 +160,7 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
             // RFC 8484 SS.4.1: zero the DNS ID before upstream forwarding (same as POST path)
             if (decoded.length >= 2) { decoded[0] = 0; decoded[1] = 0; }
           }
-          const processed = processEdnsOutgoing(decoded, cfg, cookieBytes);
-          let reenc = "";
-          for (let i = 0; i < processed.length; i++) reenc += String.fromCharCode(processed[i]);
-          dnsParam = btoa(reenc).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+          dnsParam = bytesToBase64url(processEdnsOutgoing(decoded, cfg, cookieBytes));
         } catch {}
       }
       target.searchParams.set("dns", dnsParam);
@@ -146,15 +172,19 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
     } else {
       // JSON GET mode
       const target = new URL(upstreamUrl);
-      // Iterate the allowlist and read each value with get(), which returns the
-      // FIRST occurrence -- the same one buildCacheKey uses. Iterating the
-      // client's params instead let a repeated key diverge the two: set() keeps
-      // the last value, so "?name=a&name=b" would query b upstream and cache the
-      // answer under a, letting any client bind an arbitrary answer to any name.
-      for (const k of ALLOWED_JSON_PARAMS) {
-        const v = url.searchParams.get(k);
-        if (v !== null) target.searchParams.set(k, v);
-      }
+      // Only an allowlist reaches the upstream: forwarding arbitrary client
+      // params (e.g. edns_client_subnet) would leak client identity to it.
+      // name, type and cd are sent as jsonQuery interprets them -- the reading
+      // buildCacheKey keys on -- never as the client spelled them. Forwarding
+      // raw values let the two diverge: "?name=a&name=b" queried b and cached
+      // the answer under a, and a Unicode name the upstream folded differently
+      // could bind one domain's answer to another's key.
+      const q = jsonQuery(url);
+      target.searchParams.set("name", q.name);
+      target.searchParams.set("type", q.type);
+      if (q.cd) target.searchParams.set("cd", "1");
+      const ct = url.searchParams.get("ct");
+      if (ct !== null) target.searchParams.set("ct", ct);
       // ECS forward mode: also pass edns_client_subnet if present in client request
       if (cfg && cfg.PRIVACY_ECS_MODE === "forward") {
         const ecs = url.searchParams.get("edns_client_subnet");
@@ -168,7 +198,6 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       // cache is always populated with signatures regardless of the client DO bit.
       // The handler strips DNSSEC RRs from responses sent to non-DO clients.
       target.searchParams.set("do", "1");
-      if (!target.searchParams.has("name")) target.searchParams.set("name", ".");
       resp = await fetch(target.href, {
         method: "GET",
         headers: { Accept: "application/dns-json" },
@@ -188,7 +217,7 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
     if (ct.includes("dns-message")) {
       // The timeout must stay armed across the body read: headers can arrive
       // promptly and the body then stall forever, which would hang the fan-out.
-      const rawFull = new Uint8Array(await readCapped(resp, maxMessage));
+      const rawFull = await readCapped(resp, maxMessage);
       clearTimeout(timer);
       // A 200 with a body too short to be a DNS message is not a usable answer;
       // without this it scores as ok and can win pickBestResult and be cached.
@@ -221,7 +250,7 @@ export async function queryUpstream(index, upstreamUrl, method, url, bodyBytes, 
       return { index, ok: true, blocked, wire: true, raw, hasDnssec: hasDnssecData(raw) };
     }
 
-    const json = JSON.parse(new TextDecoder().decode(await readCapped(resp, maxMessage)));
+    const json = JSON.parse(new TextDecoder().decode(await readCapped(resp, maxMessage * JSON_SIZE_FACTOR)));
     clearTimeout(timer);
     if (debug) console.log(`[DoH] Upstream[${index}] json: Status=${json.Status} hasAnswer=${Array.isArray(json.Answer)} hasAuthority=${Array.isArray(json.Authority)} authorityLen=${Array.isArray(json.Authority) ? json.Authority.length : 0}`);
     if (isServerFailure(json)) return { index, ok: false };

@@ -7,6 +7,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { makeFakeCache, dispatch } from "../helpers/worker.js";
 import { buildDnsQuery, buildDnsResponse } from "../../src/dns.js";
+import { queryUpstream, COOKIE_STORE } from "../../src/upstream.js";
+import { getConfig } from "../../src/config.js";
 
 const TWO_UPSTREAMS = JSON.stringify([
   "https://u1.example.com/dns-query",
@@ -106,5 +108,63 @@ describe("background refresh honours the all-responded rule", () => {
     const after = new Uint8Array(await cache.store.get(key).clone().arrayBuffer());
     const rdata = Array.from(after.slice(after.length - 4)).join(".");
     expect(rdata).toBe("1.1.1.1"); // original entry retained, not the partial result
+  });
+});
+
+describe("upstream bodies are bounded while they are read", () => {
+  const CLIENT_URL = new URL("https://w.example.com/dns-query");
+
+  it("a body without Content-Length is abandoned once it passes the cap", async () => {
+    // A chunked stream declares no size, so only reading it incrementally can
+    // stop it; buffering it whole first would hold it all in the isolate.
+    let sent = 0;
+    globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (sent >= 1_000_000) { controller.close(); return; }
+        controller.enqueue(new Uint8Array(10_000));
+        sent += 10_000;
+      },
+    }), { status: 200, headers: { "Content-Type": "application/dns-message" } }));
+
+    const res = await queryUpstream(0, "https://u1.example.com/dns-query", "POST", CLIENT_URL,
+      buildDnsQuery("a.example", 1), false, getConfig({}));
+    expect(res.ok).toBe(false);
+    expect(sent).toBeLessThan(1_000_000);
+  });
+
+  it("a JSON answer larger than the wire limit is still accepted", async () => {
+    // JSON spells out every owner name, so it outgrows the same answer on the
+    // wire; capping it at MAX_DNS_MESSAGE_SIZE turned it into SERVFAIL.
+    const Answer = [];
+    for (let i = 0; i < 1500; i++) Answer.push({ name: "big.example.", type: 1, TTL: 300, data: `10.0.${i >> 8}.${i & 255}` });
+    const body = JSON.stringify({ Status: 0, Question: [{ name: "big.example.", type: 1 }], Answer });
+    expect(body.length).toBeGreaterThan(65535);
+    globalThis.fetch = vi.fn(async () => new Response(body, { headers: { "Content-Type": "application/dns-json" } }));
+
+    const res = await queryUpstream(0, "https://u1.example.com/dns-query", "GET",
+      new URL("https://w.example.com/dns-query?name=big.example&type=A"), null, true, getConfig({}));
+    expect(res.ok).toBe(true);
+    expect(res.json.Answer.length).toBe(1500);
+  });
+});
+
+describe("per-upstream cookie state is bounded", () => {
+  afterEach(() => COOKIE_STORE.clear());
+
+  it("stays capped when a {PROFILE_ID} template yields one upstream URL per profile", async () => {
+    // Any client can name any of 16.7M profile ids, so an uncapped store keyed
+    // by resolved URL grows until the isolate runs out of memory.
+    COOKIE_STORE.clear();
+    globalThis.fetch = vi.fn(async () => wireResp(buildDnsResponse("a.example", "1.2.3.4")));
+    const cfg = getConfig({});
+    const url = new URL("https://w.example.com/dns-query");
+    const q = buildDnsQuery("a.example", 1);
+    for (let i = 0; i < 1100; i++) {
+      await queryUpstream(0, `https://u.example.com/${i.toString(16).padStart(6, "0")}`, "POST", url, q, false, cfg);
+    }
+    expect(COOKIE_STORE.size).toBe(1024);
+    // The newest profiles survive eviction; the oldest were dropped first.
+    expect(COOKIE_STORE.has("https://u.example.com/00044b")).toBe(true);
+    expect(COOKIE_STORE.has("https://u.example.com/000000")).toBe(false);
   });
 });

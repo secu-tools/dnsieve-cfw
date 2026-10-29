@@ -16,6 +16,8 @@ export default {
         const detail = (err instanceof Error) ? (err.message || "unknown") : (err != null ? String(err) : "unknown");
         console.error(`[DoH] Internal error: ${detail}`);
       }
+      // Built inline rather than with handler.js's errorResponse: this is the
+      // fallback for failures in that module, so it must not depend on it.
       return new Response(
         JSON.stringify({ error: "Internal worker error" }),
         { status: 500, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } }

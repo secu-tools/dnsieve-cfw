@@ -15,9 +15,9 @@ import {
   GENERAL_PROFILE_ID,
   getConfig,
 } from "./config.js";
-import { HEX_TABLE, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, normalizeType, extractQueryNameType, buildBlockedResponse, buildServfailResponse, setTtlWire, setTtlJson, base64urlToBytes, hasEcsOption } from "./dns.js";
+import { bytesToHex, hasNsidRequest, injectNsidToResponse, hasDoBit, stripDnssecFromWire, stripDnssecFromJson, clearDoBitInResponse, DNS_TYPE_TO_NUMBER, extractQueryNameType, buildBlockedResponse, buildServfailResponse, setTtlWire, setTtlJson, base64urlToBytes, hasEcsOption } from "./dns.js";
 import { buildUpstreamUrl, queryUpstream } from "./upstream.js";
-import { buildCacheKey, putCache, computeClientTtl, shouldRenewCache, remainingClientTtl, stripCacheBookkeeping } from "./cache.js";
+import { buildCacheKey, jsonQuery, putCache, computeClientTtl, shouldRenewCache, remainingClientTtl, stripCacheBookkeeping } from "./cache.js";
 import { VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
@@ -80,24 +80,24 @@ export function buildResponse(result, profileId, isBlocked, allResponded, cfg) {
 /**
  * Apply client-specific per-response EDNS patching: DNSSEC stripping for
  * non-DO clients (RFC 4035 Section 3.1.4.1, see stripDnssecFromWire), NSID
- * injection (substitute mode; nsidValue is null when not needed), and DNS
- * transaction ID restore. A single body-read covers all wire operations.
+ * injection (substitute mode; nsidValue is null when not needed), TTL stamping
+ * and DNS transaction ID restore. A single body-read covers all wire operations;
+ * each step is a no-op when it has nothing to change.
  *
  * @param {Response} response
  * @param {number} dnsId
  * @param {string|null} nsidValue
  * @param {boolean} clientWantsDo
  * @param {number} queryQtype
+ * @param {object} cfg
  * @returns {Promise<Response>}
  */
 async function applyClientEdns(response, dnsId, nsidValue, clientWantsDo, queryQtype, cfg) {
   const ct = response.headers.get("content-type") || "";
   const ttl = remainingClientTtl(response.headers, cfg);
+  const init = { status: response.status, headers: clientHeaders(response.headers, ttl, cfg.DEBUG) };
 
   if (ct.includes("dns-message")) {
-    if (dnsId === 0 && nsidValue === null && clientWantsDo && ttl === null) {
-      return new Response(response.body, { status: response.status, headers: clientHeaders(response.headers, null, cfg && cfg.DEBUG) });
-    }
     let buf = new Uint8Array(await response.arrayBuffer());
     if (!clientWantsDo) {
       buf = stripDnssecFromWire(buf, queryQtype);
@@ -108,19 +108,16 @@ async function applyClientEdns(response, dnsId, nsidValue, clientWantsDo, queryQ
     if (nsidValue !== null) buf = injectNsidToResponse(buf, nsidValue);
     if (ttl !== null) buf = setTtlWire(buf, ttl);
     if (dnsId !== 0 && buf.length >= 2) { buf[0] = (dnsId >> 8) & 0xff; buf[1] = dnsId & 0xff; }
-    return new Response(buf, { status: response.status, headers: clientHeaders(response.headers, ttl, cfg && cfg.DEBUG) });
+    return new Response(buf, init);
   }
 
-  if (ct.includes("dns-json") && (!clientWantsDo || ttl !== null)) {
-    // JSON path: strip DNSSEC records for non-DO clients.
-    // We must always rebuild the Response here because response.json() consumes
-    // the body stream regardless of whether any records are actually removed.
+  if (ct.includes("dns-json")) {
     let json = await response.json();
     if (!clientWantsDo) json = stripDnssecFromJson(json, queryQtype);
     if (ttl !== null) json = setTtlJson(json, ttl);
-    return new Response(JSON.stringify(json), { status: response.status, headers: clientHeaders(response.headers, ttl, cfg && cfg.DEBUG) });
+    return new Response(JSON.stringify(json), init);
   }
-  return new Response(response.body, { status: response.status, headers: clientHeaders(response.headers, ttl, cfg && cfg.DEBUG) });
+  return new Response(response.body, init);
 }
 
 // Headers for a response leaving the worker. putCache stores entries with the
@@ -180,27 +177,13 @@ function pickBestResult(results) {
     if (r.hasDnssec && !bestDnssec) bestDnssec = r;
     if (!bestPlain) bestPlain = r;
   }
-  if (bestDnssec) return bestDnssec;
-  return bestPlain;
+  return bestDnssec || bestPlain;
 }
 
 // ---------------------------------------------------------------------------
 // Blocked response builder (with configurable blocking mode)
 // ---------------------------------------------------------------------------
 
-/**
- * Build a client-facing response for a blocked domain using the configured
- * blocking mode. For wire-format clients, generates a local DNS response.
- * For JSON clients, builds a JSON response matching the blocking mode.
- *
- * @param {object} blockedResult - The upstream result that detected the block
- * @param {string} profileId
- * @param {string[]} upstreamUrls - Resolved upstream URLs
- * @param {Uint8Array|null} bodyBytes - Original wire query (for wire response building)
- * @param {boolean} isJsonGet - Whether the client wants JSON
- * @param {object} cfg - Runtime config
- * @returns {Response}
- */
 // Hostname of an upstream URL, for client-facing diagnostics. Falls back to
 // the empty string rather than echoing an unparseable value.
 function upstreamHost(rawUrl) {
@@ -212,63 +195,50 @@ function upstreamHost(rawUrl) {
   }
 }
 
-function buildBlockedResponseForClient(blockedResult, profileId, upstreamUrls, bodyBytes, isJsonGet, cfg, clientCd = false) {
-  const mode = cfg.BLOCKING_MODE || "null";
+/**
+ * Build a client-facing response for a blocked domain using the configured
+ * blocking mode. For wire-format clients, generates a local DNS response from
+ * the original query (the handler has already rejected queries shorter than a
+ * DNS header). For JSON clients, builds a JSON response matching the mode.
+ *
+ * @param {object} blockedResult - The upstream result that detected the block
+ * @param {object} rq - Request context (see handleRequest)
+ * @returns {Response}
+ */
+function buildBlockedResponseForClient(blockedResult, rq) {
+  const mode = rq.cfg.BLOCKING_MODE || "null";
+  const ttl = computeClientTtl(blockedResult, true, rq.cfg);
+  const extra = {
+    "Cache-Control": `public, max-age=${ttl}`,
+    "X-Profile-Id": rq.profileId,
+    "X-Client-Cache-TTL": String(ttl),
+    "X-Blocked": "true",
+    "X-Upstream-Index": String(blockedResult.index),
+    "X-Blocking-Mode": mode,
+    "X-Worker-Version": VERSION,
+  };
+  // Both forms leave record TTLs at 0; they are stamped at egress, where the
+  // entry's age is known, so the cached copy holds no time-relative value.
+
+  if (rq.isJsonGet) {
+    const json = buildBlockedJson(blockedResult, mode, rq.clientCd);
+    return new Response(JSON.stringify(json), { status: 200, headers: dohJsonHeaders(extra) });
+  }
+
   // EDE text names the blocking upstream by host only (RFC 8914 info code 15).
   // The full URL would disclose its path to every client that trips a block,
   // and an upstream template such as https://dns.nextdns.io/{PROFILE_ID} puts
   // the operator's profile id -- effectively a bearer secret -- in that path.
-  const edeText = `Blocked (${upstreamHost(upstreamUrls[blockedResult.index])})`;
-
-  if (isJsonGet) {
-    // JSON blocking response
-    const ttl = computeClientTtl(blockedResult, true, cfg);
-    // Stamped once at egress, so the cached copy holds no time-relative value.
-    const json = buildBlockedJson(blockedResult, mode, edeText, clientCd);
-    return new Response(JSON.stringify(json), {
-      status: 200,
-      headers: dohJsonHeaders({
-        "Cache-Control": `public, max-age=${ttl}`,
-        "X-Profile-Id": profileId,
-        "X-Client-Cache-TTL": String(ttl),
-        "X-Blocked": "true",
-        "X-Upstream-Index": String(blockedResult.index),
-        "X-Blocking-Mode": mode,
-        "X-Worker-Version": VERSION,
-      }),
-    });
-  }
-
-  // Wire blocking response
-  if (bodyBytes && bodyBytes.length >= 12) {
-    const ttl = computeClientTtl(blockedResult, true, cfg);
-    // As above: TTL=0 here, stamped at egress where the entry's age is known.
-    const wireResp = buildBlockedResponse(bodyBytes, mode, { edeText });
-    return new Response(wireResp, {
-      status: 200,
-      headers: dohWireHeaders({
-        "Cache-Control": `public, max-age=${ttl}`,
-        "X-Profile-Id": profileId,
-        "X-Client-Cache-TTL": String(ttl),
-        "X-Blocked": "true",
-        "X-Upstream-Index": String(blockedResult.index),
-        "X-Blocking-Mode": mode,
-        "X-Worker-Version": VERSION,
-      }),
-    });
-  }
-
-  // Fallback: return the upstream response as-is (e.g. GET wire where we don't have bodyBytes)
-  return buildResponse(blockedResult, profileId, true, false, cfg);
+  const edeText = `Blocked (${upstreamHost(rq.upstreamUrls[blockedResult.index])})`;
+  const wireResp = buildBlockedResponse(rq.bodyBytes || rq.wireGetBytes, mode, { edeText });
+  return new Response(wireResp, { status: 200, headers: dohWireHeaders(extra) });
 }
 
 /**
  * Build a JSON blocked response matching the configured blocking mode.
  */
-function buildBlockedJson(blockedResult, mode, edeText, clientCd = false) {
-  // Start from upstream JSON if available, otherwise build minimal
-  const base = blockedResult.json ? { ...blockedResult.json } : {};
-  const question = base.Question || [];
+function buildBlockedJson(blockedResult, mode, clientCd = false) {
+  const question = (blockedResult.json && blockedResult.json.Question) || [];
 
   switch (mode) {
     case "nxdomain":
@@ -292,6 +262,48 @@ function buildBlockedJson(blockedResult, mode, edeText, clientCd = false) {
       return { Status: 0, TC: false, RD: true, RA: true, AD: false, CD: clientCd, Question: question, Answer: answers.length ? answers : undefined };
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Upstream fan-out and outcome
+// ---------------------------------------------------------------------------
+
+// Queries every upstream concurrently: one promise per upstream, in priority
+// order. queryUpstream reports failures as { ok: false } rather than rejecting.
+function fanOut(rq) {
+  return rq.upstreamUrls.map((u, i) =>
+    queryUpstream(i, u, rq.method, rq.url, rq.bodyBytes, rq.isJsonGet, rq.cfg, rq.wireGetBytes));
+}
+
+// One result per upstream, in priority order, from settled fan-out promises.
+function settledResults(settlements) {
+  return settlements.map((s, i) => s.status === "fulfilled" ? s.value : { index: i, ok: false });
+}
+
+// The shared edge cache only takes an outcome once every upstream has answered.
+// Caching a partial fan-out would let a transient upstream failure replace a
+// blocked verdict with the surviving upstream's clean answer, un-blocking the
+// domain for every client on this profile.
+function allResponded(results) {
+  return results.every(r => r && r.ok);
+}
+
+// The response a settled fan-out resolves to. A block from any upstream wins
+// (lowest index first); otherwise the best clean answer (see pickBestResult).
+// Returns null when no upstream produced a usable answer.
+function resolveOutcome(results, rq) {
+  const blocked = results.find(r => r && r.ok && r.blocked);
+  if (blocked) return { result: blocked, isBlocked: true, resp: buildBlockedResponseForClient(blocked, rq) };
+  const best = pickBestResult(results);
+  if (!best) return null;
+  return { result: best, isBlocked: false, resp: buildResponse(best, rq.profileId, false, allResponded(results), rq.cfg) };
+}
+
+// Writes a settled fan-out's outcome to the edge cache, under allResponded's rule.
+async function cacheOutcome(cache, key, results, rq) {
+  if (!allResponded(results)) return;
+  const outcome = resolveOutcome(results, rq);
+  if (outcome) await putCache(cache, key, outcome.resp, outcome.isBlocked, rq.cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,47 +332,18 @@ function startBackgroundRefresh(ctx, key, run) {
   if (INFLIGHT_REFRESH.has(key)) return false;
   INFLIGHT_REFRESH.add(key);
   ctx.waitUntil((async () => {
-    // run() builds its upstream list eagerly and so can throw synchronously.
     try { await run(); } catch { /* best-effort */ }
     finally { INFLIGHT_REFRESH.delete(key); }
   })());
   return true;
 }
 
-// Re-queries all upstreams and writes the freshest result back to the edge
-// cache.  Called via ctx.waitUntil() after a stale-but-valid cached response
-// has already been returned to the client, so errors here are silent.
-async function backgroundRefreshCache(cache, cacheKeyReq, request, url, bodyBytes, wireQueryBytes, isJsonGet, profileId, upstreamUrls, cfg, clientCd) {
-  try {
-    const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg, wireQueryBytes));
-    const settlements = await Promise.allSettled(promises);
-    const results = settlements.map((s, i) => s.status === "fulfilled" ? s.value : { index: i, ok: false });
-
-    // Same rule as the main path: only write to the shared cache once every
-    // upstream has answered. Caching a partial fan-out would let a transient
-    // upstream failure replace a blocked verdict with the surviving upstream's
-    // clean answer, un-blocking the domain for every client on this profile.
-    let okCount = 0;
-    for (let i = 0; i < results.length; i++) if (results[i] && results[i].ok) okCount++;
-    if (okCount !== results.length) return;
-
-    // Blocked result takes priority: cache it first if any upstream confirms.
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
-      if (r && r.ok && r.blocked) {
-        const resp = buildBlockedResponseForClient(r, profileId, upstreamUrls, bodyBytes || wireQueryBytes, isJsonGet, cfg, clientCd);
-        await putCache(cache, cacheKeyReq, resp, true, cfg);
-        return;
-      }
-    }
-
-    // Otherwise cache the best clean result.
-    const best = pickBestResult(results);
-    if (best) {
-      const resp = buildResponse(best, profileId, false, true, cfg);
-      await putCache(cache, cacheKeyReq, resp, false, cfg);
-    }
-  } catch {}
+// Re-queries all upstreams and writes the outcome back to the edge cache under
+// the same rules as a cache miss. Called via ctx.waitUntil() after a
+// stale-but-valid cached response has already been returned to the client.
+async function backgroundRefreshCache(cache, cacheKeyReq, rq) {
+  const results = settledResults(await Promise.allSettled(fanOut(rq)));
+  await cacheOutcome(cache, cacheKeyReq, results, rq);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +385,8 @@ export async function handleRequest(request, env, ctx) {
     return errorResponse(415, "Unsupported Media Type. POST must use Content-Type: application/dns-message.");
   }
 
-  const isWirePost = request.method === "POST" && ct.includes("application/dns-message");
+  // Every POST reaching here is application/dns-message (checked above).
+  const isWirePost = request.method === "POST";
   const isWireGet  = request.method === "GET" && url.searchParams.has("dns");
   // Wire GET takes priority over JSON GET when both ?dns and ?name are present (RFC 8484 SS.4.2).
   const isJsonGet  = request.method === "GET" && url.searchParams.has("name") && !isWireGet;
@@ -415,10 +399,9 @@ export async function handleRequest(request, env, ctx) {
   }
 
   if (!isWirePost && !isWireGet && !isJsonGet) {
-    return new Response(
+    return errorResponse(400,
       JSON.stringify({ error: "Invalid DoH request. Use ?name=&type= (JSON), ?dns= (wire GET), or POST with application/dns-message." }),
-      { status: 400, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } }
-    );
+      { "Content-Type": "application/json" });
   }
 
   let bodyBytes = null;
@@ -431,84 +414,74 @@ export async function handleRequest(request, env, ctx) {
   // stripped from responses (RFC 4035 S3.1.4.1). Upstreams always get DO=1.
   let clientWantsDo = false;
   // Checking Disabled (RFC 4035 S3.1.6): preserved in the wire bytes for wire
-  // requests; sourced from ?cd=1 for JSON DoH.
+  // requests; sourced from ?cd= for JSON DoH.
   let clientCd = false;
   // Numeric DNS type of the first question: the DNSSEC strip exception keeps
   // this type in Answer even for non-DO clients (e.g. ?type=RRSIG).
   let queryQtype = 1; // default A
 
-  if (isWirePost) {
-    bodyBytes = new Uint8Array(await request.arrayBuffer());
-    if (bodyBytes.length > cfg.MAX_DNS_MESSAGE_SIZE) {
-      return errorResponse(413, "Content Too Large.");
+  if (isJsonGet) {
+    // JSON DoH has no wire header: ?do= and ?cd= stand in for the DO and CD
+    // bits, read exactly as the cache key and the upstream query read them.
+    const q = jsonQuery(url);
+    clientWantsDo = q.do;
+    clientCd = q.cd;
+    queryQtype = DNS_TYPE_TO_NUMBER[q.type] ?? (parseInt(q.type, 10) || 1);
+  } else {
+    let wire;
+    if (isWirePost) {
+      wire = new Uint8Array(await request.arrayBuffer());
+      if (wire.length > cfg.MAX_DNS_MESSAGE_SIZE) return errorResponse(413, "Content Too Large.");
+    } else {
+      try {
+        // Same size gate as POST, applied before the output buffer is allocated.
+        wire = base64urlToBytes(url.searchParams.get("dns") || "", cfg.MAX_DNS_MESSAGE_SIZE);
+      } catch (e) {
+        if (e instanceof RangeError) return errorResponse(413, "Content Too Large.");
+        // RFC 8484 S.4.1: the ?dns= value MUST be a valid non-padding base64url string.
+        return errorResponse(400, "Bad Request. Invalid base64url encoding in ?dns= parameter.");
+      }
     }
-    // A valid DNS message requires at least a 12-byte header; a shorter body is always
-    // malformed and will cause upstream servers to return HTTP 4xx/5xx errors.
-    if (bodyBytes.length < 12) {
-      return errorResponse(400, "Bad Request. DNS message body too short.");
+    // A valid DNS message requires at least a 12-byte header; a shorter one is
+    // always malformed and would only draw HTTP 4xx/5xx errors from upstreams.
+    if (wire.length < 12) {
+      return errorResponse(400, isWirePost
+        ? "Bad Request. DNS message body too short."
+        : "Bad Request. DNS message in ?dns= parameter is too short.");
     }
-    clientDnsId = (bodyBytes[0] << 8) | bodyBytes[1];
-    // Extract DO bit and query type from client's original wire message.
-    clientWantsDo = hasDoBit(bodyBytes);
-    const postMeta = extractQueryNameType(bodyBytes);
-    if (postMeta) queryQtype = postMeta.qtype;
-    // RFC 8484 SS.4.1: zero the DNS ID for upstream and cache key
-    if (bodyBytes[0] !== 0 || bodyBytes[1] !== 0) {
-      bodyBytes[0] = 0; bodyBytes[1] = 0;
-    }
-    if (cfg.DEBUG) {
-      let hex = ""; const n = Math.min(bodyBytes.length, 40);
-      for (let i = 0; i < n; i++) hex += HEX_TABLE[bodyBytes[i]];
-      console.log(`[DoH] POST body: ${bodyBytes.length}B  hex[0:${n}]=${hex}  clientDnsId=${clientDnsId}  clientWantsDo=${clientWantsDo}  queryQtype=${queryQtype}`);
-    }
-  } else if (isWireGet) {
-    let decoded;
-    try {
-      // Same size gate as POST, applied before the output buffer is allocated.
-      decoded = base64urlToBytes(url.searchParams.get("dns") || "", cfg.MAX_DNS_MESSAGE_SIZE);
-    } catch (e) {
-      if (e instanceof RangeError) return errorResponse(413, "Content Too Large.");
-      // RFC 8484 S.4.1: the ?dns= value MUST be a valid non-padding base64url string.
-      return errorResponse(400, "Bad Request. Invalid base64url encoding in ?dns= parameter.");
-    }
-    // RFC 8484 S.4.1: a valid DNS message requires at least a 12-byte header.
-    if (decoded.length < 12) {
-      return errorResponse(400, "Bad Request. DNS message in ?dns= parameter is too short.");
-    }
-    clientDnsId = (decoded[0] << 8) | decoded[1];
-    // RFC 8484 SS.4.1: zero the DNS ID (same as the POST path) -- cached
+    clientDnsId = (wire[0] << 8) | wire[1];
+    // RFC 8484 SS.4.1: zero the DNS ID for upstream and cache key -- cached
     // messages must never carry one client's transaction ID; applyClientEdns
     // restores the original ID on the direct reply.
-    if (decoded[0] !== 0 || decoded[1] !== 0) {
-      decoded[0] = 0; decoded[1] = 0;
+    wire[0] = 0; wire[1] = 0;
+    clientWantsDo = hasDoBit(wire);
+    queryQtype = extractQueryNameType(wire)?.qtype ?? 1;
+    if (isWirePost) bodyBytes = wire; else wireGetQueryBytes = wire;
+    if (cfg.DEBUG) {
+      const n = Math.min(wire.length, 40);
+      console.log(`[DoH] wire query: ${wire.length}B  hex[0:${n}]=${bytesToHex(wire.subarray(0, n))}  clientDnsId=${clientDnsId}  clientWantsDo=${clientWantsDo}  queryQtype=${queryQtype}`);
     }
-    wireGetQueryBytes = decoded;
-    clientWantsDo = hasDoBit(decoded);
-    const getMeta = extractQueryNameType(decoded);
-    if (getMeta) queryQtype = getMeta.qtype;
-  } else if (isJsonGet) {
-    // For JSON DoH, the DO bit equivalent is the ?do=1 query parameter.
-    clientWantsDo = url.searchParams.get("do") === "1";
-    // CD bit equivalent: ?cd=1 (mirrored to synthetic responses per RFC 4035 S3.1.6).
-    clientCd = url.searchParams.get("cd") === "1";
-    const typeStr = url.searchParams.get("type") || "A";
-    const normType = normalizeType(typeStr);
-    queryQtype = DNS_TYPE_TO_NUMBER[normType] !== undefined
-      ? DNS_TYPE_TO_NUMBER[normType]
-      : (parseInt(typeStr, 10) || 1);
   }
 
-  // Detect whether client is requesting NSID (RFC 5001) for substitute mode.
-  // Only meaningful for wire-format requests (JSON mode has no EDNS OPT record).
-  let clientWantsNsid = false;
-  if (cfg.PRIVACY_NSID_MODE === "substitute") {
-    if (isWirePost && bodyBytes) {
-      clientWantsNsid = hasNsidRequest(bodyBytes);
-    } else if (isWireGet && wireGetQueryBytes) {
-      // wireGetQueryBytes is already decoded and validated above.
-      clientWantsNsid = hasNsidRequest(wireGetQueryBytes);
-    }
-  }
+  // NSID substitute mode answers a client's NSID request itself (RFC 5001).
+  // Only wire requests can carry one: JSON mode has no EDNS OPT record.
+  const nsidValue = cfg.PRIVACY_NSID_MODE === "substitute" && hasNsidRequest(bodyBytes || wireGetQueryBytes)
+    ? cfg.PRIVACY_NSID_VALUE
+    : null;
+  const reply = (resp, nsid = nsidValue) => applyClientEdns(resp, clientDnsId, nsid, clientWantsDo, queryQtype, cfg);
+
+  // Everything the fan-out, outcome and refresh paths need about this request.
+  const rq = {
+    method: request.method,
+    url,
+    bodyBytes,
+    wireGetBytes: wireGetQueryBytes,
+    isJsonGet,
+    clientCd,
+    profileId,
+    upstreamUrls: cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId)),
+    cfg,
+  };
 
   // Cache lookup
   // In ECS forward mode the client's own subnet is sent upstream and changes the
@@ -526,93 +499,53 @@ export async function handleRequest(request, env, ctx) {
     if (cfg.DEBUG) console.log(`[DoH] Cache HIT  profileId=${profileId}`);
     // Stale-while-revalidate: refresh in the background when remaining TTL is low.
     if (cfg.CACHE_RENEW_PERCENT > 0 && shouldRenewCache(cached, cfg)) {
-      // Built inside the callback so it is only materialised when a refresh
-      // actually starts; most hits in the renewal window are deduplicated.
-      const started = startBackgroundRefresh(ctx, cacheKey.url, () =>
-        backgroundRefreshCache(cache, cacheKey, request, url, bodyBytes, wireGetQueryBytes, isJsonGet, profileId,
-          cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId)), cfg, clientCd));
+      const started = startBackgroundRefresh(ctx, cacheKey.url, () => backgroundRefreshCache(cache, cacheKey, rq));
       if (cfg.DEBUG) console.log(`[DoH] Cache renew ${started ? "triggered" : "skipped (already in flight)"}  profileId=${profileId}`);
     }
-    return applyClientEdns(cached, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
+    return reply(cached);
   }
   if (cfg.DEBUG) console.log(`[DoH] Cache MISS - querying ${cfg.UPSTREAM_COUNT} upstreams`);
 
-  // Fan out to all upstreams concurrently
-  const upstreamUrls = cfg.UPSTREAM_SERVERS.map(t => buildUpstreamUrl(t, profileId));
-  const promises = upstreamUrls.map((u, i) => queryUpstream(i, u, request.method, url, bodyBytes, isJsonGet, cfg, wireGetQueryBytes));
+  const promises = fanOut(rq);
 
-  const results = new Array(upstreamUrls.length);
-  let settledCount = 0;
-  let blocked = null;
-
-  const collection = new Promise(resolve => {
-    for (let i = 0; i < promises.length; i++) {
-      promises[i].then(r => {
-        results[r.index] = r;
-        settledCount++;
-        if (r.ok && r.blocked && !blocked) { blocked = r; resolve(); }
-        if (settledCount === promises.length) resolve();
-      }).catch(() => {
-        settledCount++;
-        if (settledCount === promises.length) resolve();
-      });
+  // Phase 1: wait for the first upstream to confirm a block, or for every
+  // upstream to settle, or for the minimum wait window -- whichever is first.
+  const firstBlock = new Promise(resolve => {
+    let pending = promises.length;
+    if (pending === 0) resolve(null);
+    for (const p of promises) {
+      p.then(r => { if (r.ok && r.blocked) resolve(r); }, () => {})
+        .finally(() => { if (--pending === 0) resolve(null); });
     }
   });
-
-  const minWait = new Promise(r => setTimeout(r, cfg.MIN_WAIT_MS));
-
-  // Phase 1: wait for first block confirmation OR minimum wait window
-  await Promise.race([collection, minWait]);
+  const minWait = new Promise(r => setTimeout(() => r(null), cfg.MIN_WAIT_MS));
+  const blocked = await Promise.race([firstBlock, minWait]);
 
   // Early block return: answer as soon as one upstream reports a block, then
-  // finish the fan-out in the background and cache the verdict if every
+  // finish the fan-out in the background and cache its outcome if every
   // upstream answered -- the same rule phase 2 applies. A resolver block is
   // among the fastest answers an upstream produces, so almost every block takes
   // this path; without the deferred write the edge cache would never hold one
   // and each repeat query would re-run the whole fan-out.
   if (blocked) {
-    if (cfg.DEBUG) console.log(`[DoH] Early BLOCKED from upstream[${blocked.index}] (${upstreamUrls[blocked.index]})`);
-    const resp = buildBlockedResponseForClient(blocked, profileId, upstreamUrls, bodyBytes || wireGetQueryBytes, isJsonGet, cfg, clientCd);
-    const toCache = resp.clone();
-    ctx.waitUntil(Promise.allSettled(promises).then(async (settled) => {
-      if (!ecsForwarded && settled.every(s => s.status === "fulfilled" && s.value && s.value.ok)) {
-        await putCache(cache, cacheKey, toCache, true, cfg);
-      }
-    }));
-    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
+    if (cfg.DEBUG) console.log(`[DoH] Early BLOCKED from upstream[${blocked.index}] (${rq.upstreamUrls[blocked.index]})`);
+    if (!ecsForwarded) {
+      ctx.waitUntil(Promise.allSettled(promises).then(settled => cacheOutcome(cache, cacheKey, settledResults(settled), rq)));
+    }
+    return reply(buildBlockedResponseForClient(blocked, rq));
   }
 
   // Phase 2: wait for all upstreams to finish
-  const settlements = await Promise.allSettled(promises);
-  for (let i = 0; i < settlements.length; i++) {
-    if (!results[i]) {
-      const s = settlements[i];
-      results[i] = s.status === "fulfilled" ? s.value : { index: i, ok: false };
+  const results = settledResults(await Promise.allSettled(promises));
+  const complete = allResponded(results);
+  const outcome = resolveOutcome(results, rq);
+  if (outcome) {
+    if (cfg.DEBUG) {
+      const r = outcome.result;
+      console.log(`[DoH] ${outcome.isBlocked ? "BLOCKED by" : "OK from"} upstream[${r.index}] (${rq.upstreamUrls[r.index]})  hasDnssec=${!!r.hasDnssec}  allResponded=${complete}`);
     }
-  }
-
-  let okCount = 0;
-  for (let i = 0; i < results.length; i++) if (results[i] && results[i].ok) okCount++;
-  const allResponded = okCount === results.length;
-
-  // Check for blocked responses after all are settled
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r && r.ok && r.blocked) {
-      if (cfg.DEBUG) console.log(`[DoH] BLOCKED by upstream[${r.index}] (${upstreamUrls[r.index]})  allResponded=${allResponded}`);
-      const resp = buildBlockedResponseForClient(r, profileId, upstreamUrls, bodyBytes || wireGetQueryBytes, isJsonGet, cfg, clientCd);
-      if (allResponded && !ecsForwarded) ctx.waitUntil(putCache(cache, cacheKey, resp.clone(), true, cfg));
-      return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
-    }
-  }
-
-  // Pick the best clean result with DNSSEC preference
-  const best = pickBestResult(results);
-  if (best) {
-    if (cfg.DEBUG) console.log(`[DoH] OK from upstream[${best.index}] (${upstreamUrls[best.index]})  hasDnssec=${!!best.hasDnssec}  allResponded=${allResponded}`);
-    const resp = buildResponse(best, profileId, false, allResponded, cfg);
-    if (allResponded && !ecsForwarded) ctx.waitUntil(putCache(cache, cacheKey, resp.clone(), false, cfg));
-    return applyClientEdns(resp, clientDnsId, clientWantsNsid ? cfg.PRIVACY_NSID_VALUE : null, clientWantsDo, queryQtype, cfg);
+    if (complete && !ecsForwarded) ctx.waitUntil(putCache(cache, cacheKey, outcome.resp.clone(), outcome.isBlocked, cfg));
+    return reply(outcome.resp);
   }
 
   // All upstreams failed: build a synthetic SERVFAIL from the original query,
@@ -620,19 +553,18 @@ export async function handleRequest(request, env, ctx) {
   // the error is never cached (RFC 2308).
   if (cfg.DEBUG) console.log(`[DoH] All ${cfg.UPSTREAM_COUNT} upstreams failed (SERVFAIL) profileId=${profileId}`);
 
+  // Both forms leave through reply(), like every other answer, so the
+  // diagnostic headers are dropped unless DEBUG is on.
   const servfailExtra = { "Cache-Control": "no-store", "X-Profile-Id": profileId, "X-Worker-Version": VERSION };
 
   if (isJsonGet) {
     // JSON DoH: return SERVFAIL as application/dns-json (Status=2)
     const qname = url.searchParams.get("name") || ".";
-    const qtypeNum = queryQtype;
-    const servfailJson = { Status: 2, TC: false, RD: true, RA: true, AD: false, CD: clientCd, Question: [{ name: qname, type: qtypeNum }] };
-    return new Response(JSON.stringify(servfailJson), { status: 200, headers: dohJsonHeaders(servfailExtra) });
+    const servfailJson = { Status: 2, TC: false, RD: true, RA: true, AD: false, CD: clientCd, Question: [{ name: qname, type: queryQtype }] };
+    return reply(new Response(JSON.stringify(servfailJson), { status: 200, headers: dohJsonHeaders(servfailExtra) }), null);
   }
 
   // Wire DoH (POST or GET): build SERVFAIL from original query bytes.
-  const queryBytesForServfail = bodyBytes || wireGetQueryBytes || null;
-  const servfailWire = buildServfailResponse(queryBytesForServfail);
-  const servfailResp = new Response(servfailWire, { status: 200, headers: dohWireHeaders(servfailExtra) });
-  return applyClientEdns(servfailResp, clientDnsId, null, clientWantsDo, queryQtype, cfg);
+  const servfailWire = buildServfailResponse(bodyBytes || wireGetQueryBytes);
+  return reply(new Response(servfailWire, { status: 200, headers: dohWireHeaders(servfailExtra) }), null);
 }

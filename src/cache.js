@@ -14,12 +14,18 @@
 // shared entry hands a wire stub a JSON body (or the reverse) -- unparseable,
 // for the whole entry lifetime. Cross-format sharing only ever worked when
 // every client used the same format, in which case this partition costs
-// nothing. For wire requests the question
-// name and type are extracted from the decoded message and normalised
-// (toASCII / normalizeType); malformed queries fall back to a SHA-256 hash
-// key. DNS transaction ID is always 0 in cached messages (RFC 8484 SS.4.1).
+// nothing.
+//
+// Every key must describe exactly what the upstream is asked, or one client
+// can bind an answer to a name another client then looks up:
+//   - Wire: the question name keeps its raw octets with ASCII-only case folding
+//     (wireQueryKey); queries the name+type key cannot fully describe fall back
+//     to a key over their exact bytes (SHA-256 for POST, the ?dns= value for GET).
+//   - JSON: jsonQuery interprets the parameters once, and the upstream query is
+//     built from that same reading.
+// DNS transaction ID is always 0 in cached messages (RFC 8484 SS.4.1).
 
-import { HEX_TABLE, toASCII, normalizeType, stripBase64Padding, extractMinTtlWire, extractMinTtl, extractQueryNameType, extractHeaderFlags, base64urlToBytes, DNS_NUMBER_TO_TYPE } from "./dns.js";
+import { toASCII, normalizeType, stripBase64Padding, extractMinTtlWire, extractMinTtl, wireQueryKey, extractHeaderFlags, base64urlToBytes, bytesToHex } from "./dns.js";
 import {
   MIN_CACHE_TTL_FLOOR,
   WORKER_CACHE_TTL_SECONDS,
@@ -29,23 +35,27 @@ import {
   CACHE_RENEW_PERCENT,
 } from "./config.js";
 
-// Build the canonical cache key URL from extracted query name and numeric type.
-// The type segment is percent-encoded: for JSON GET requests it can contain an
-// arbitrary client-supplied string, and a raw "/" or "../" inside it would let
-// a crafted ?type= value collide with (and poison) another record's cache key.
-// flagsVariant namespaces non-standard queries (see queryFlagsVariant).
-// Canonical name segment for a cache key.
+// Lower-cases ASCII letters only. String.prototype.toLowerCase is
+// Unicode-aware and maps U+212A KELVIN SIGN to ASCII "k", which would key
+// "faceboo" + U+212A + ".com" as facebook.com; DNS folds ASCII case and
+// nothing else (RFC 4343 Section 3).
+function asciiLower(s) {
+  return s.replace(/[A-Z]+/g, m => m.toLowerCase());
+}
+
+// Canonical form of a JSON ?name= value: no trailing dot, IDNs as punycode.
+// jsonQuery forwards this exact string upstream, so the key and the query
+// always name the same domain whatever the upstream does with Unicode.
 //
 // toASCII resolves IDNs via URL parsing, which truncates at "/", "?", "#" and
 // discards everything before "@" -- so distinct DNS names could map onto one
 // key. A label may legally contain any octet, so anything that does not round
-// trip is kept verbatim (already escaped per RFC 4343 by readDnsName) rather
-// than being silently rewritten.
-function canonicalName(rawName) {
+// trip is kept verbatim (ASCII case aside) rather than being silently rewritten.
+function canonicalJsonName(rawName) {
   const stripped = rawName.replace(/\.$/, "") || ".";
-  if (/[/?#@%\\:]/.test(stripped)) return stripped.toLowerCase();
+  if (/[/?#@%\\:]/.test(stripped)) return asciiLower(stripped);
   const folded = toASCII(stripped);
-  return isLosslessFold(stripped, folded) ? folded : stripped.toLowerCase();
+  return isLosslessFold(stripped, folded) ? folded : asciiLower(stripped);
 }
 
 // True when `folded` is a faithful IDNA encoding of `name` rather than a lossy
@@ -53,9 +63,9 @@ function canonicalName(rawName) {
 //
 // toASCII runs the name through URL parsing, and UTS-46 mapping is many-to-one:
 // it deletes ignorable code points (U+00AD, U+200B, U+FEFF ...) and maps
-// compatibility forms (U+3002, U+FF0E) onto ".". Those are distinct DNS names
-// on the wire, and the upstream is queried with the unmapped bytes, so folding
-// them together lets one name's answer be cached under another's key.
+// compatibility forms (U+3002, U+FF0E) onto ".". Those are distinct DNS names,
+// so folding them together would answer a query for one with the other's
+// records -- and cache that answer under the other's key.
 //
 // A genuine IDN label always comes back punycode-encoded, so require that: same
 // label count, and each label either unchanged ASCII or an "xn--" encoding.
@@ -76,18 +86,55 @@ function isLosslessFold(name, folded) {
 
 const ASCII_LABEL_RE = /^[\x00-\x7f]*$/;
 
-function metaToCacheKey(profileId, rawName, qtype, flagsVariant = "") {
-  const name = canonicalName(rawName);
-  const type = DNS_NUMBER_TO_TYPE[qtype] ? normalizeType(DNS_NUMBER_TO_TYPE[qtype]) : String(qtype);
+// Builds the cache key for a canonical name and type. Both segments are
+// percent-encoded: JSON clients supply them as arbitrary strings, and a raw "/"
+// or "../" would let a crafted value collide with (and poison) another key.
+// suffix namespaces non-standard queries and the JSON format (see below).
+function keyRequest(profileId, name, type, suffix) {
   return new Request(
-    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${encodeURIComponent(type)}${flagsVariant}`,
+    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${encodeURIComponent(type)}${suffix}`,
     { method: "GET" }
   );
 }
 
+// Suffix separating JSON-format entries from wire-format ones. Lower-case, so
+// it cannot collide with the upper-cased type segment, and empty for wire so
+// existing wire keys are unchanged.
+const JSON_FORMAT_VARIANT = "!fjson";
+
+// True for every spelling of a boolean flag (?cd=, ?do=) that an upstream JSON
+// API accepts. Matching only "1" would let ?cd=true reach the upstream with
+// validation disabled while the answer is keyed as a standard query -- the
+// exact partition queryFlagsVariant exists to enforce.
+function isJsonFlagSet(value) {
+  if (value === null || value === undefined) return false;
+  const v = String(value).trim().toLowerCase();
+  return v === "1" || v === "true" || v === "t" || v === "yes";
+}
+
+/**
+ * The single interpretation of a JSON DoH request's parameters. The cache key,
+ * the upstream query (queryUpstream) and the client-facing flags (handler) are
+ * all built from it, so no spelling of a parameter -- a repeated key, "true"
+ * for "1", a Unicode name, "1abc" as a type -- can mean one thing to the key
+ * and another upstream. Repeated parameters resolve to their first occurrence.
+ *
+ * @param {URL} url
+ * @returns {{ name: string, type: string, cd: boolean, do: boolean }}
+ */
+export function jsonQuery(url) {
+  const p = url.searchParams;
+  return {
+    name: canonicalJsonName(p.get("name") || "."),
+    type: normalizeType(p.get("type")),
+    cd: isJsonFlagSet(p.get("cd")),
+    do: isJsonFlagSet(p.get("do")),
+  };
+}
+
 // Cache-key suffix isolating non-standard queries in their own namespace.
 //
-// The cache key is deliberately shared across request formats and DO values,
+// The cache key is deliberately shared across request forms and DO values,
 // but header flags that change what the upstream returns MUST partition the
 // cache: a CD=1 query bypasses upstream DNSSEC validation (RFC 4035 S3.2.2),
 // an RD=0 query is answered without recursion, and a non-QUERY opcode yields
@@ -95,24 +142,9 @@ function metaToCacheKey(profileId, rawName, qtype, flagsVariant = "") {
 // standard queries for the same name/type are served from.
 //
 // Standard queries (opcode QUERY, RD=1, CD=0) return "" so the established
-// key format - and cross-format cache sharing - is unchanged for them.
-// The suffix cannot collide with the type segment: normalizeType upper-cases
-// client-supplied types, while this suffix contains lower-case letters.
-// Suffix separating JSON-format entries from wire-format ones. Lower-case, so
-// it cannot collide with the upper-cased type segment, and empty for wire so
-// existing wire keys are unchanged.
-const JSON_FORMAT_VARIANT = "!fjson";
-
-// True for every spelling of CD that an upstream JSON API accepts. Matching only
-// "1" would let ?cd=true reach the upstream with validation disabled while the
-// answer is keyed as a standard query -- the exact partition this exists to
-// enforce.
-function isCdSet(value) {
-  if (value === null || value === undefined) return false;
-  const v = String(value).trim().toLowerCase();
-  return v === "1" || v === "true" || v === "t" || v === "yes";
-}
-
+// key format is unchanged for them. The suffix cannot collide with the type
+// segment: normalizeType upper-cases client-supplied types, while this suffix
+// contains lower-case letters.
 function queryFlagsVariant(opcode, rd, cd) {
   if (opcode === 0 && rd && !cd) return "";
   return `!o${opcode}r${rd ? 1 : 0}c${cd ? 1 : 0}`;
@@ -124,18 +156,22 @@ function wireFlagsVariant(buf) {
   return flags ? queryFlagsVariant(flags.opcode, flags.rd, flags.cd) : "";
 }
 
+// Name+type key for a plain wire query, or null when wireQueryKey says the
+// query carries more than name and type describe.
+function wireNameKey(profileId, buf) {
+  const meta = wireQueryKey(buf);
+  return meta && keyRequest(profileId, meta.name, normalizeType(String(meta.qtype)), wireFlagsVariant(buf));
+}
+
 // Builds the cache lookup key for a request.
 // wireGetBytes: optional pre-decoded ?dns= payload (the handler already
 // base64url-decodes wire GET requests; passing it here avoids a second decode).
-// Returns a Request for synchronous paths (JSON GET and valid wire GET/POST)
-// or a Promise<Request> for wire POST when name extraction fails (SHA-256 fallback).
+// Returns a Request for synchronous paths (JSON GET, plain wire queries and the
+// wire GET fallback) or a Promise<Request> for the wire POST fallback (SHA-256).
 export function buildCacheKey(profileId, url, bodyBytes, wireGetBytes = null) {
-  // Wire POST: extract name+type from body (synchronous for well-formed queries)
+  // Wire POST: name+type for plain queries, else a hash of the exact bytes.
   if (bodyBytes) {
-    const meta = extractQueryNameType(bodyBytes);
-    if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype, wireFlagsVariant(bodyBytes));
-    // Fallback for malformed queries: SHA-256 hash of the body bytes
-    return buildCacheKeyAsync(profileId, bodyBytes);
+    return wireNameKey(profileId, bodyBytes) || buildCacheKeyAsync(profileId, bodyBytes);
   }
 
   // Wire GET: use pre-decoded bytes when supplied, otherwise decode base64url
@@ -146,10 +182,8 @@ export function buildCacheKey(profileId, url, bodyBytes, wireGetBytes = null) {
         buf = base64urlToBytes(url.searchParams.get("dns") || "");
       } catch { buf = null; }
     }
-    if (buf) {
-      const meta = extractQueryNameType(buf);
-      if (meta) return metaToCacheKey(profileId, meta.name, meta.qtype, wireFlagsVariant(buf));
-    }
+    const key = buf && wireNameKey(profileId, buf);
+    if (key) return key;
     // Fallback: use stripped base64url directly as the key segment
     return new Request(
       `https://doh-cache.internal/${profileId}/wire/${encodeURIComponent(stripBase64Padding(url.searchParams.get("dns") || ""))}`,
@@ -157,26 +191,16 @@ export function buildCacheKey(profileId, url, bodyBytes, wireGetBytes = null) {
     );
   }
 
-  // JSON GET: name and type are already in the URL parameters.
-  // The JSON API has no opcode/RD equivalent (always QUERY with recursion),
-  // but ?cd=1 is forwarded upstream and must partition the cache like the
-  // wire-format CD bit does.
-  const rawName = url.searchParams.get("name") || ".";
-  const name = canonicalName(rawName);
-  const type = normalizeType(url.searchParams.get("type"));
-  const flagsVariant = queryFlagsVariant(0, true, isCdSet(url.searchParams.get("cd")));
-  return new Request(
-    `https://doh-cache.internal/${profileId}/json/${encodeURIComponent(name)}/${encodeURIComponent(type)}${flagsVariant}${JSON_FORMAT_VARIANT}`,
-    { method: "GET" }
-  );
+  // JSON GET. The JSON API has no opcode/RD equivalent (always QUERY with
+  // recursion), but ?cd= is forwarded upstream and must partition the cache
+  // like the wire-format CD bit does.
+  const q = jsonQuery(url);
+  return keyRequest(profileId, q.name, q.type, queryFlagsVariant(0, true, q.cd) + JSON_FORMAT_VARIANT);
 }
 
 async function buildCacheKeyAsync(profileId, bodyBytes) {
-  const hashBuf = await crypto.subtle.digest("SHA-256", bodyBytes);
-  const hb = new Uint8Array(hashBuf);
-  let hex = "";
-  for (let i = 0; i < hb.length; i++) hex += HEX_TABLE[hb[i]];
-  return new Request(`https://doh-cache.internal/${profileId}/wire/${hex}`, { method: "GET" });
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bodyBytes));
+  return new Request(`https://doh-cache.internal/${profileId}/wire/${bytesToHex(hash)}`, { method: "GET" });
 }
 
 // Writes a response clone to the edge cache with the worker-side TTL header applied.

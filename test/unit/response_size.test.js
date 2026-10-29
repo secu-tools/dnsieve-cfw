@@ -76,6 +76,30 @@ describe("responses carry no diagnostic headers by default", () => {
     expect(resp.headers.get("cache-control")).toMatch(/max-age=\d+/);
   });
 
+  it("SERVFAIL omits them too, in both wire and JSON form", async () => {
+    // The JSON SERVFAIL once bypassed the egress path and kept X-Profile-Id and
+    // X-Worker-Version.
+    globalThis.fetch = vi.fn(async () => new Response("down", { status: 503 }));
+    const originalCaches = globalThis.caches;
+    globalThis.caches = { default: makeFakeCache() };
+    try {
+      for (const req of [
+        new Request("https://w.example.com/dns-query?name=a.example.com&type=A",
+          { headers: { Accept: "application/dns-json" } }),
+        new Request("https://w.example.com/dns-query", {
+          method: "POST", headers: { "Content-Type": "application/dns-message" },
+          body: buildDnsQuery("a.example.com", 1, 0),
+        }),
+      ]) {
+        const resp = await handleRequest(req, { UPSTREAM_SERVERS: ONE }, { waitUntil: () => {} });
+        expect(resp.headers.get("cache-control")).toBe("no-store");
+        for (const h of DIAGNOSTIC) expect(resp.headers.get(h), h).toBe(null);
+      }
+    } finally {
+      globalThis.caches = originalCaches;
+    }
+  });
+
   it("DEBUG restores the diagnostic headers", async () => {
     const resp = await send({ UPSTREAM_SERVERS: ONE, DEBUG: "true" });
     expect(resp.headers.get("X-Blocked")).toBe("false");

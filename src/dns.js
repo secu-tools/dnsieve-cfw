@@ -161,7 +161,28 @@ function encodeBase32Hex(bytes) {
   return result;
 }
 
-// Advances past a DNS name at offset off and returns the new offset.
+// Standard base64 of a byte range. The char-by-char loop is deliberate: it is
+// several times faster than String.fromCharCode(...bytes) and does not risk a
+// call-stack overflow on large records.
+function bytesToBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  return btoa(out);
+}
+
+// Unpadded base64url (RFC 4648 Section 5) of a byte range; the inverse of
+// base64urlToBytes.
+export function bytesToBase64url(bytes) {
+  return stripBase64Padding(bytesToBase64(bytes)).replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+// Lower-case hex of a byte range.
+export function bytesToHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += HEX_TABLE[bytes[i]];
+  return out;
+}
+
 /**
  * Decode a base64url string into bytes (RFC 4648 Section 5), as used by the
  * ?dns= parameter of RFC 8484 GET requests.
@@ -175,15 +196,6 @@ function encodeBase32Hex(bytes) {
  * @param {number} [maxBytes=Infinity]
  * @returns {Uint8Array}
  */
-// Standard base64 of a byte range. The char-by-char loop is deliberate: it is
-// several times faster than String.fromCharCode(...bytes) and does not risk a
-// call-stack overflow on large records.
-function bytesToBase64(bytes) {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
-  return btoa(out);
-}
-
 export function base64urlToBytes(b64, maxBytes = Infinity) {
   const clean = b64.replace(/-/g, "+").replace(/_/g, "/");
   const bin = atob(clean + "=".repeat((4 - clean.length % 4) % 4));
@@ -209,6 +221,7 @@ export function extractHeaderFlags(buf) {
   };
 }
 
+// Advances past a DNS name at offset off and returns the new offset.
 export function skipName(buf, off) {
   while (off < buf.length) {
     const len = buf[off];
@@ -238,6 +251,77 @@ export function extractQueryNameType(buf) {
     const qtype = (buf[offset] << 8) | buf[offset + 1];
     return { name, qtype };
   } catch { return null; }
+}
+
+// Canonical text of one label for a cache key. ASCII letters are lower-cased --
+// the only case folding DNS performs (RFC 4343 Section 3) -- other printable
+// ASCII is kept, "." and "\" are escaped, and every remaining octet is written
+// as \DDD (RFC 4343 Section 2.1). Unlike the UTF-8 decoding readDnsName uses for
+// display, this is injective: two labels share a form only when a resolver
+// treats them as the same label.
+function keyLabel(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b >= 0x41 && b <= 0x5a) s += String.fromCharCode(b | 0x20);
+    else if (b === 0x2e || b === 0x5c) s += "\\" + String.fromCharCode(b);
+    else if (b > 0x20 && b < 0x7f) s += String.fromCharCode(b);
+    else s += "\\" + String(b).padStart(3, "0");
+  }
+  return s;
+}
+
+/**
+ * Identity of a wire query for the shared cache key: the canonical question
+ * name (no trailing dot) and qtype.
+ *
+ * Returns null unless the query is a plain one that name and type fully
+ * describe: QDCOUNT=1, class IN, no compression in the name, no answer or
+ * authority records, nothing in the additional section but OPT (which
+ * processEdnsOutgoing replaces), and no header bits set beyond opcode, RD, CD
+ * and AD (opcode/RD/CD partition the key; AD is moot as upstreams are always
+ * asked with DO=1). Any other shape sends the upstream something the key does
+ * not capture, so the caller must key it on its exact bytes instead.
+ *
+ * The name keeps the raw label octets (see keyLabel): resolvers compare labels
+ * octet by octet with ASCII-only case folding, so any wider folding -- Unicode
+ * case mapping, IDNA, lossy UTF-8 decoding -- lets one name's answer be cached
+ * under another's key.
+ *
+ * @param {Uint8Array} buf
+ * @returns {{ name: string, qtype: number }|null}
+ */
+export function wireQueryKey(buf) {
+  if (!buf || buf.length < 12) return null;
+  // QR, AA, TC, Z and RCODE must be clear in a query.
+  if ((buf[2] & 0x86) || (buf[3] & 0x4f)) return null;
+  if (((buf[4] << 8) | buf[5]) !== 1 || buf[6] || buf[7] || buf[8] || buf[9]) return null;
+
+  const labels = [];
+  let off = 12;
+  for (;;) {
+    if (off >= buf.length) return null;
+    const len = buf[off];
+    if (len === 0) break;
+    if (len > 63) return null; // compression pointer or reserved label type
+    if (off + 1 + len > buf.length) return null;
+    labels.push(keyLabel(buf.subarray(off + 1, off + 1 + len)));
+    off += 1 + len;
+  }
+  off += 1;
+  if (off + 4 > buf.length) return null;
+  const qtype = (buf[off] << 8) | buf[off + 1];
+  if (((buf[off + 2] << 8) | buf[off + 3]) !== 1) return null; // QCLASS IN
+  off += 4;
+
+  const arcount = (buf[10] << 8) | buf[11];
+  for (let i = 0; i < arcount; i++) {
+    off = skipName(buf, off);
+    if (off + 10 > buf.length || ((buf[off] << 8) | buf[off + 1]) !== 41) return null;
+    off += 10 + ((buf[off + 8] << 8) | buf[off + 9]);
+    if (off > buf.length) return null;
+  }
+  return { name: labels.length ? labels.join(".") : ".", qtype };
 }
 
 // ---------------------------------------------------------------------------
@@ -292,9 +376,14 @@ function parseOpt(buf) {
           const len  = (buf[optOff + 2] << 8) | buf[optOff + 3];
           // An option LENGTH must stay inside the OPT record. Slicing to the
           // buffer end instead would pull in whole following records and copy
-          // them back out inside the option's data.
-          if (optOff + 4 + len > rrEnd) return null;
-          options.push({ code, data: buf.slice(optOff + 4, optOff + 4 + len) });
+          // them back out inside the option's data. The walk stops there
+          // rather than discarding the whole OPT: callers rebuild the record
+          // from these options, and a null here would make processEdnsIncoming
+          // pass the upstream's cookie, NSID and ECS through untouched.
+          if (optOff + 4 + len > rrEnd) break;
+          // A view, not a copy: every consumer either reads only the code or
+          // copies the data into a new record.
+          options.push({ code, data: buf.subarray(optOff + 4, optOff + 4 + len) });
           optOff += 4 + len;
         }
         return { rrStart, rrEnd, off, doBit, options };
@@ -372,13 +461,14 @@ function removeOpt(buf, opt) {
 //     verbatim (RFC 6891 Section 6.1.1 permits at most one).
 // Either way the client's ECS, cookie or NSID survives a mode that promises to
 // remove it. Rebuilding from the counted records drops both, and anything
-// trailing the last counted record with it.
+// trailing the last counted record with it. An OPT is dropped from whichever
+// section holds it, and each section's count is rewritten to match.
 //
 // Falls back to header+question when the records cannot be walked: a message we
 // cannot parse is one we cannot sanitise, so nothing after the question is
-// forwarded. Returns null only when even the question is unreadable.
+// forwarded. By the same rule, a question that cannot be walked leaves only the
+// header, with every count zeroed. The caller guarantees a 12-byte header.
 function stripAllOpts(buf) {
-  if (buf.length < 12) return null;
   const qdcount = (buf[4] << 8) | buf[5];
   const ancount = (buf[6] << 8) | buf[7];
   const nscount = (buf[8] << 8) | buf[9];
@@ -388,27 +478,27 @@ function stripAllOpts(buf) {
   for (let q = 0; q < qdcount; q++) {
     off = skipName(buf, off);
     off += 4;
-    if (off > buf.length) return null;
+    if (off > buf.length) {
+      const header = buf.slice(0, 12);
+      header.fill(0, 4);
+      return header;
+    }
   }
   const questionEnd = off;
 
   const kept = [];
-  let arKept = 0;
-  let walked = true;
+  const counts = [0, 0, 0]; // records kept in Answer, Authority, Additional
   for (let i = 0; i < ancount + nscount + arcount; i++) {
     const start = off;
     off = skipName(buf, off);
-    if (off + 10 > buf.length) { walked = false; break; }
-    const rrtype = (buf[off] << 8) | buf[off + 1];
-    const end = off + 10 + ((buf[off + 8] << 8) | buf[off + 9]);
-    if (end > buf.length) { walked = false; break; }
-    if (rrtype !== 41) {
+    const end = off + 10 > buf.length ? -1 : off + 10 + ((buf[off + 8] << 8) | buf[off + 9]);
+    if (end < 0 || end > buf.length) { kept.length = 0; counts.fill(0); break; }
+    if (((buf[off] << 8) | buf[off + 1]) !== 41) {
       kept.push({ start, end });
-      if (i >= ancount + nscount) arKept++;
+      counts[i < ancount ? 0 : i < ancount + nscount ? 1 : 2]++;
     }
     off = end;
   }
-  if (!walked) { kept.length = 0; arKept = 0; }
 
   let len = questionEnd;
   for (const k of kept) len += k.end - k.start;
@@ -417,9 +507,10 @@ function stripAllOpts(buf) {
   let w = questionEnd;
   for (const k of kept) { out.set(buf.subarray(k.start, k.end), w); w += k.end - k.start; }
 
-  if (!walked) { out[6] = 0; out[7] = 0; out[8] = 0; out[9] = 0; }
-  out[10] = (arKept >> 8) & 0xff;
-  out[11] = arKept & 0xff;
+  for (let s = 0; s < 3; s++) {
+    out[6 + s * 2] = (counts[s] >> 8) & 0xff;
+    out[7 + s * 2] = counts[s] & 0xff;
+  }
   return out;
 }
 
@@ -522,11 +613,12 @@ export function buildEcsOption(subnetStr) {
  */
 export function processEdnsOutgoing(buf, cfg, cookieBytes) {
   if (buf.length < 12) return buf;
-  const opt = parseOpt(buf);
+  // Only the forward modes read the client's options.
+  const forwarding  = cfg.PRIVACY_ECS_MODE === "forward" || cfg.PRIVACY_NSID_MODE === "forward";
+  const opt         = forwarding ? parseOpt(buf) : null;
   const addCookie   = cfg.PRIVACY_COOKIES_MODE === "reoriginate" && cookieBytes != null;
   const addSubstEcs = cfg.PRIVACY_ECS_MODE     === "substitute"  && !!cfg.PRIVACY_ECS_SUBNET;
 
-  const doBit = true; // always forced on (see doc comment above)
   const newOptions = [];
 
   // ECS
@@ -551,9 +643,7 @@ export function processEdnsOutgoing(buf, cfg, cookieBytes) {
   // An OPT record with DO=1 is always emitted in outgoing queries. Every OPT the
   // client sent is removed first, so nothing it attached can reach the upstream
   // regardless of what its header counts claimed.
-  const base = stripAllOpts(buf);
-  if (base === null) return buf; // question unreadable; upstream will reject it
-  return appendOpt(base, buildOptRecord(doBit, newOptions));
+  return appendOpt(stripAllOpts(buf), buildOptRecord(true, newOptions));
 }
 
 // ---------------------------------------------------------------------------
@@ -755,13 +845,6 @@ export function hasDoBit(buf) {
 }
 
 /**
- * Returns true if the DNS wire query contains an NSID request option (code 3).
- * Returns false for null/short buffers or when no NSID option is found.
- *
- * @param {Uint8Array|null} buf
- * @returns {boolean}
- */
-/**
  * True when the query carries an EDNS Client Subnet option (RFC 7871, code 8).
  * Used to keep subnet-specific answers out of the shared edge cache.
  *
@@ -773,6 +856,13 @@ export function hasEcsOption(buf) {
   return !!opt && opt.options.some(o => o.code === 8);
 }
 
+/**
+ * Returns true if the DNS wire query contains an NSID request option (code 3).
+ * Returns false for null/short buffers or when no NSID option is found.
+ *
+ * @param {Uint8Array|null} buf
+ * @returns {boolean}
+ */
 export function hasNsidRequest(buf) {
   if (!buf || buf.length < 12) return false;
   const opt = parseOpt(buf);
@@ -927,9 +1017,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           const tag   = (buf[off] << 8) | buf[off + 1];
           const alg   = buf[off + 2];
           const dtype = buf[off + 3];
-          let digest = "";
-          for (let i = 4; i < rdlength && off + i < buf.length; i++) digest += HEX_TABLE[buf[off + i]];
-          return `${tag} ${alg} ${dtype} ${digest}`;
+          return `${tag} ${alg} ${dtype} ${bytesToHex(buf.subarray(off + 4, off + rdlength))}`;
         }
         break;
       }
@@ -973,11 +1061,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
           const iters   = (buf[off + 2] << 8) | buf[off + 3];
           const saltLen = buf[off + 4];
           let p = off + 5;
-          const salt = saltLen === 0 ? "-" : (() => {
-            let s = "";
-            for (let i = 0; i < saltLen && p + i < buf.length; i++) s += HEX_TABLE[buf[p + i]];
-            return s;
-          })();
+          const salt = saltLen === 0 ? "-" : bytesToHex(buf.subarray(p, p + saltLen));
           p += saltLen;
           if (p + 1 > off + rdlength) break;
           const hashLen = buf[p++];
@@ -1003,9 +1087,7 @@ export function parseRdata(buf, off, rrtype, rdlength) {
     }
   } catch {}
   // Unknown or malformed: return hex
-  let hex = "";
-  for (let i = 0; i < rdlength && off + i < buf.length; i++) hex += HEX_TABLE[buf[off + i]];
-  return hex;
+  return bytesToHex(buf.subarray(off, off + rdlength));
 }
 
 /**
@@ -1316,15 +1398,18 @@ export function buildServfailResponse(queryBytes) {
       off = skipName(queryBytes, off);
       off += 4; // QTYPE + QCLASS
     }
-    const questionLen = off - 12;
+    // A question that runs past the query is dropped, as in buildBlockedResponse:
+    // copying it short would leave QDCOUNT claiming bytes the message lacks.
+    const truncated = off > queryBytes.length;
+    const questionLen = truncated ? 0 : off - 12;
     const buf = new Uint8Array(12 + questionLen);
     buf[0] = queryBytes[0]; buf[1] = queryBytes[1]; // ID (0 per RFC 8484; restored by applyClientEdns)
     // RFC 1035 S4.1.1: OPCODE and RD bits MUST be copied from the request into the response.
     // RFC 4035 S3.1.6: CD bit MUST be copied from the request into the response.
     buf[2] = 0x80 | (queryBytes[2] & 0x79); // QR=1, OPCODE+RD mirrored from query
     buf[3] = 0x80 | (queryBytes[3] & 0x10) | 0x02; // RA=1, CD mirrored, SERVFAIL rcode=2
-    buf[4] = queryBytes[4]; buf[5] = queryBytes[5]; // QDCOUNT
-    for (let i = 0; i < questionLen; i++) buf[12 + i] = queryBytes[12 + i];
+    if (!truncated) { buf[4] = queryBytes[4]; buf[5] = queryBytes[5]; } // QDCOUNT
+    buf.set(queryBytes.subarray(12, 12 + questionLen), 12);
     return buf;
   } catch {
     return makeHeader();
@@ -1345,24 +1430,7 @@ export function buildServfailResponse(queryBytes) {
  * @returns {Uint8Array}
  */
 export function buildDnsQueryWithDo(name, qtype, id = 0, doBit = true) {
-  const base = buildDnsQuery(name, qtype, id);
-  // Minimal OPT RR: root name (1) + type OPT (2) + CLASS/payload (2) +
-  //                 extended RCODE+version (2) + Z/DO (2) + RDLENGTH (2) = 11 bytes
-  const opt = new Uint8Array(11);
-  opt[0] = 0x00;                              // root name label
-  opt[1] = 0x00; opt[2] = 0x29;              // TYPE OPT (41)
-  opt[3] = 0x10; opt[4] = 0x00;              // CLASS = 4096 (UDP payload size hint)
-  opt[5] = 0x00;                              // extended RCODE = 0
-  opt[6] = 0x00;                              // EDNS VERSION = 0
-  opt[7] = doBit ? 0x80 : 0x00; opt[8] = 0x00; // Z field; bit 15 = DO bit
-  opt[9] = 0x00; opt[10] = 0x00;             // RDLENGTH = 0 (no RDATA)
-  const out = new Uint8Array(base.length + opt.length);
-  out.set(base);
-  out.set(opt, base.length);
-  const newAr = ((base[10] << 8) | base[11]) + 1;
-  out[10] = (newAr >> 8) & 0xff;
-  out[11] = newAr & 0xff;
-  return out;
+  return appendOpt(buildDnsQuery(name, qtype, id), buildOptRecord(doBit, []));
 }
 
 // ---------------------------------------------------------------------------

@@ -7,13 +7,28 @@
 
 import { describe, it, expect } from "vitest";
 import {
-  stripDnssecFromWire, processEdnsOutgoing, buildBlockedResponse,
-  wireToJson, parseRdata, buildDnsQuery,
+  stripDnssecFromWire, processEdnsOutgoing, processEdnsIncoming, buildBlockedResponse,
+  buildServfailResponse, wireToJson, parseRdata, buildDnsQuery, buildDnsResponse,
+  hasDoBit, hasNsidRequest,
 } from "../../src/dns.js";
 
 const STRIP_CFG = {
   PRIVACY_ECS_MODE: "strip", PRIVACY_COOKIES_MODE: "strip", PRIVACY_NSID_MODE: "strip",
 };
+
+// True when `needle` occurs as a contiguous run inside `hay`.
+function hasBytes(hay, needle) {
+  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+    return true;
+  }
+  return false;
+}
+
+// OPT RR header (root name, TYPE=41, CLASS=4096, TTL with the given DO byte)
+// followed by RDATA.
+const optRecord = (rdata, doByte = 0x00) =>
+  [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, doByte, 0x00, rdata.length >> 8, rdata.length & 0xff, ...rdata];
 
 describe("stripDnssecFromWire never emits a corrupted message", () => {
   it("returns the input untouched when a record is truncated mid-header", () => {
@@ -71,6 +86,45 @@ describe("malformed OPT records do not throw out of a rebuild path", () => {
   });
 });
 
+describe("EDNS sanitising fails closed on malformed input", () => {
+  it("an upstream OPT with an overrunning option is still rebuilt, dropping its NSID", () => {
+    // NSID "up-1", then an option declaring 50 bytes where 2 remain. Treating
+    // the whole OPT as unparseable once passed it to clients untouched.
+    const nsid = [0x75, 0x70, 0x2d, 0x31];
+    const msg = new Uint8Array([
+      ...buildDnsResponse("a.example", "1.2.3.4"),
+      ...optRecord([0x00, 0x03, 0x00, 0x04, ...nsid, 0x00, 0x63, 0x00, 0x32, 0x01, 0x02], 0x80),
+    ]);
+    msg[11] = 1;
+    const out = processEdnsIncoming(msg, STRIP_CFG, null);
+    expect(hasBytes(out, nsid)).toBe(false);
+    expect(hasNsidRequest(out)).toBe(false);
+    expect(hasDoBit(out)).toBe(true);
+  });
+
+  it("an OPT placed in the Answer section is removed and ANCOUNT corrected", () => {
+    const q = buildDnsQuery("a.example", 1);
+    const msg = new Uint8Array([...q, ...optRecord([])]);
+    msg[7] = 1; // ANCOUNT=1: the OPT sits in the answer section
+    const out = processEdnsOutgoing(msg, STRIP_CFG, null);
+    expect((out[6] << 8) | out[7]).toBe(0);
+    expect((out[10] << 8) | out[11]).toBe(1); // only the proxy's own OPT
+    expect(out.length).toBe(q.length + 11);
+  });
+
+  it("a question that cannot be walked forwards the header alone", () => {
+    // QDCOUNT=20 over one question: the walk runs off the end, and the raw
+    // bytes -- with the client's ECS option -- were once forwarded as-is.
+    const ecs = [0x00, 0x08, 0x00, 0x07, 0x00, 0x01, 0x18, 0x00, 0xc6, 0x33, 0x64];
+    const msg = new Uint8Array([...buildDnsQuery("a.example", 1), ...optRecord(ecs)]);
+    msg[5] = 20; msg[11] = 1;
+    const out = processEdnsOutgoing(msg, STRIP_CFG, null);
+    expect(hasBytes(out, ecs)).toBe(false);
+    expect(Array.from(out.subarray(4, 10))).toEqual([0, 0, 0, 0, 0, 0]);
+    expect(out.length).toBe(12 + 11); // header + the proxy's own OPT
+  });
+});
+
 describe("synthesised blocked responses stay self-consistent", () => {
   it("emits no question and no answer when the query's question is truncated", () => {
     // A 0xc00c owner-name pointer needs a question to point at; without one it
@@ -80,6 +134,15 @@ describe("synthesised blocked responses stay self-consistent", () => {
     expect((r[4] << 8) | r[5]).toBe(0); // QDCOUNT
     expect((r[6] << 8) | r[7]).toBe(0); // ANCOUNT
     expect(wireToJson(r)).not.toBe(null);
+  });
+
+  it("SERVFAIL drops a question that runs past the query instead of copying it short", () => {
+    const q = buildDnsQuery("a.example", 1);
+    q[5] = 3; // QDCOUNT=3 over a single question
+    const r = buildServfailResponse(q);
+    expect(r.length).toBe(12);
+    expect((r[4] << 8) | r[5]).toBe(0); // QDCOUNT
+    expect(r[3] & 0x0f).toBe(2);        // still SERVFAIL
   });
 
   it("still answers 0.0.0.0 for a well-formed query", () => {

@@ -33,7 +33,7 @@ and fans them out concurrently to multiple upstream DoH servers. It:
 |---|---|
 | RFC 8484 compliant | Wire-format GET (`?dns=`) and POST |
 | JSON DoH | `?name=example.com&type=A` (Google/Cloudflare convention) |
-| IDN / Unicode domains | Normalised to ACE / Punycode for cache key consistency |
+| IDN / Unicode domains | JSON `?name=` normalised to ACE / Punycode and forwarded in that form; wire names cached by their exact octets (ASCII case-insensitive) |
 | Multi-upstream fan-out | All upstreams queried concurrently; best result selected by priority |
 | Block detection | `0.0.0.0` / `::` answers and NXDOMAIN without authority (Quad9-style) |
 | Configurable blocking mode | Local block responses in `null`, `nxdomain`, `nodata`, or `refused` mode |
@@ -181,7 +181,7 @@ info-code 15 (Blocked) naming the blocking upstream.
 |---|---|
 | **Cloudflare Workers Logs** | Disabled via `[observability] enabled = false` in `wrangler.toml`. |
 | **Verbose logging** | `DEBUG = "false"` by default; no query names or client details are logged. |
-| **Query parameter forwarding** | JSON mode forwards only `name`, `type`, `ct`, `do`, `cd` (plus `edns_client_subnet` in ECS forward/substitute mode). |
+| **Query parameter forwarding** | JSON mode forwards only `name`, `type`, `ct`, `do`, `cd` (plus `edns_client_subnet` in ECS forward/substitute mode); `name`, `type` and `cd` are sent in normalised form, matching the cache key. |
 | **EDNS OPT processing** | Options handled per the privacy modes below; unknown options are stripped, on both queries and responses. |
 | **Client headers** | Upstream fetches send only `Accept` and `Content-Type` -- no client IP, `User-Agent`, or cookies. |
 | **DNS transaction IDs** | Zeroed before upstream forwarding and caching (RFC 8484); restored only on the client's reply. |
@@ -228,18 +228,24 @@ POST /dns-query                                Content-Type: application/dns-mes
 
 ## Response headers
 
-| Header | Example | Description |
+Clients receive only the headers they act on: `Content-Type`, `Cache-Control`
+(`public, max-age=<client TTL>`, or `no-store` on SERVFAIL), `Vary` and CORS. The diagnostic
+headers below are added only when `DEBUG = "true"`; they are omitted by default because they
+would be a large share of every response on metered mobile and IoT links.
+
+| Header (DEBUG only) | Example | Description |
 |---|---|---|
 | `X-Profile-Id` | `000000` | Profile ID used for this request |
 | `X-Blocked` | `true` | Whether the response was classified as blocked |
 | `X-Blocking-Mode` | `null` | Blocking mode used (only on blocked responses) |
 | `X-Upstream-Index` | `0` | Index of the upstream that provided the result |
 | `X-All-Responded` | `true` | Whether all upstreams responded before the result was returned |
-| `X-Client-Cache-TTL` | `1800` | Client TTL, written into both `Cache-Control: max-age` and the record TTLs in the response body |
+| `X-Client-Cache-TTL` | `1800` | Remaining client TTL, written into both `Cache-Control: max-age` and the record TTLs in the response body |
 | `X-Worker-Version` | `1.0.0` | Version of the deployed worker |
-| `X-Worker-Cache-TTL` | `1800` | (cached copies only) Edge cache TTL applied by the worker |
-| `X-Cache-Inserted-At` | `1713220800` | (cached copies only) Unix timestamp when the entry was cached |
-| `Cache-Control` | `public, max-age=1800` | Standard caching directive for the client |
+
+The edge-cache bookkeeping headers (`X-Worker-Cache-TTL`, `X-Cache-Inserted-At`) are internal and
+never sent to clients: an insertion timestamp on a shared cache entry would reveal when another
+client first looked the domain up.
 
 ## Error responses
 
